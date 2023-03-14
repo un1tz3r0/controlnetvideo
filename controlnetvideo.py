@@ -1,8 +1,8 @@
 """
 !pip install -q transformers xformers accelerate git+https://github.com/huggingface/accelerate.git
 !pip install -q git+https://github.com/mikegarts/diffusers.git@stablediffusion.controlnet.img2img.pipeline
-"""
 
+"""
 
 import wrapt
 import click
@@ -10,16 +10,24 @@ import numpy as np
 import torch
 import PIL.Image
 import cv2
+from PIL import Image
+from diffusers import ControlNetModel, UniPCMultistepScheduler
+from stable_diffusion_controlnet_img2img import StableDiffusionControlNetImg2ImgPipeline
+from typing import Tuple, List, FrozenSet, Sequence, MutableSequence, Mapping, Optional, Any, Type
 
-def transfer_motion(frame1, frame2, frame3, flow=None):
-  ''' uses dense optical flow and inverse flow to transfer motion from (frame1, frame2) to frame3'''
+def transfer_motion(srcframe1, srcframe2, destframe, flow:Optional[np.ndarray] = None) -> \
+    Tuple[PIL.Image.Image, np.ndarray]:
+  '''
+  uses inverse dense optical flow to transfer motion between frame1 and frame2 (and using prior motion vector f) onto frame3
+  '''
+  
   # Convert the frames to grayscale
-  gray1 = cv2.cvtColor(np.asarray(frame1), cv2.COLOR_BGR2GRAY)
-  gray2 = cv2.cvtColor(np.asarray(frame2), cv2.COLOR_BGR2GRAY)
+  gray1 = cv2.cvtColor(np.asarray(srcframe1), cv2.COLOR_BGR2GRAY)
+  gray2 = cv2.cvtColor(np.asarray(srcframe2), cv2.COLOR_BGR2GRAY)
 
   # Compute the dense optical flow from frame1 to frame2
   prev_flow = flow
-  flow = cv2.calcOpticalFlowFarneback(gray1, gray2, prev_flow, 0.5, 3, 15, 3, 5, 1.2, 0)
+  flow = cv2.calcOpticalFlowFarneback(gray1, gray2, prev_flow, 0.5, 3, 15, 3, 7, 1.5, 0)
 
   # Compute the inverse flow from frame2 to frame1
   inv_flow = -flow
@@ -31,18 +39,18 @@ def transfer_motion(frame1, frame2, frame3, flow=None):
   y_inv = np.round(y + inv_flow[...,1]).astype(np.float32)
   x_inv = np.clip(x_inv, 0, w-1)
   y_inv = np.clip(y_inv, 0, h-1)
-  warped = cv2.remap(np.asarray(frame3), x_inv, y_inv, cv2.INTER_LINEAR)
+  warped = cv2.remap(np.asarray(destframe), x_inv, y_inv, cv2.INTER_LINEAR)
 
   return PIL.Image.fromarray(warped), flow
 
-"""
-------------------------------------------------------------------------------------------------------------------------
-"""
-
-import torch
-from PIL import Image
-from diffusers import ControlNetModel, UniPCMultistepScheduler
-from stable_diffusion_controlnet_img2img import StableDiffusionControlNetImg2ImgPipeline
+def stackh(images):
+  cellh = max([image.height for image in images])
+  cellw = max([image.width for image in images])
+  result = PIL.Image.new("RGB", (cellw * len(images), cellh), "black")
+  for i, image in enumerate(images):
+    result.paste(image.convert("RGB"), (i * cellw + (cellw - image.width)//2, (cellh - image.height)//2))
+  print(f"stackh: {len(images)}, cell WxH: {cellw}x{cellh}, result WxH: {result.width}x{result.height}")
+  return result
 
 def process_frames(input_video, output_video, wrapped):
     from moviepy import editor as mp
@@ -59,32 +67,54 @@ def process_frames(input_video, output_video, wrapped):
 @click.command()
 @click.argument('input_video', type=click.Path(exists=True))
 @click.argument('output_video', type=click.Path())
-@click.option('--prompt', type=str, default=None)
-@click.option('--negative-prompt', type=str, default=None)
-@click.option('--prompt-strength', type=float, default=7.0)
-#@click.option('--scheduler', type=click.Choice(['default']), default='default')
-@click.option('--num-inference-steps', type=int, default=10)
-@click.option('--controlnet', type=click.Choice(['hed', 'canny', 'scribble', 'openpose']), default='hed')
-@click.option('--controlnet-strength', type=float, default=1.0)
-@click.option('--fix-orientation', is_flag=True, default=True)
-@click.option('--consistency-strength', type=float, default=0.5, help="Weight of the consistency, or how much of the predicted output frame is fed forward and mixed with the initial noise latent used to diffuse each frame (0.0 = no consistency, 1.0 = full consistency)")
+@click.option('--prompt', type=str, default=None, help="prompt used to guide the denoising process")
+@click.option('--negative-prompt', type=str, default=None, help="negative prompt, can be used to prevent the model from generating certain words")
+@click.option('--prompt-strength', type=float, default=7.0, help="how much influence the prompt has on the output")
+#@click.option('--scheduler', type=click.Choice(['default']), default='default', help="which scheduler to use")
+@click.option('--num-inference-steps', '--steps', type=int, default=10, help="number of inference steps, depends on the scheduler, trades off speed for quality. 20-50 is a good range from fastest to best.")
+@click.option('--controlnet', type=click.Choice(['hed', 'canny', 'scribble', 'openpose', 'midas', 'normal']), default='hed', help="which pretrained controlnet annotator to use")
+@click.option('--controlnet-strength', type=float, default=1.0, help="how much influence the controlnet annotator's output is used to guide the denoising process")
+@click.option('--fix-orientation', is_flag=True, default=True, help="resize videos shot in portrait mode on some devices to fix incorrect aspect ratio bug")
+@click.option('--init-image-strength', type=float, default=0.5, help="the init-image strength, or how much of the prompt-guided denoising process to skip in favor of starting with an existing image")
+@click.option('--feedthrough-strength', type=float, default=0.0, help="the init-image is composed by transferring motion from the input video onto each output frame, and blending it optionally with the frame input that is sent to the controlnet detector")
+@click.option('--show-detector', is_flag=True, default=False, help="show the controlnet detector output")
+@click.option('--show-input', is_flag=True, default=False, help="show the input frame")
+@click.option('--show-output', is_flag=True, default=False, help="show the output frame")
+@click.option('--show-flow', is_flag=True, default=False, help="show the motion transfer (not implemented yet)")
+@click.option('--save-intermediate-frames', type=click.Path(), default=None, help="write frames to a file during processing to visualise progress")
+def main(input_video, output_video, prompt, negative_prompt, prompt_strength, num_inference_steps, controlnet, controlnet_strength, fix_orientation, init_image_strength, feedthrough_strength, show_detector, show_input, show_output, show_flow, save_intermediate_frames):
 
-def main(input_video, output_video, prompt, negative_prompt, num_inference_steps, prompt_strength, controlnet, controlnet_strength, fix_orientation, consistency_strength):
   # run controlnet pipeline on video
 
-  from controlnet_aux import CannyDetector, OpenposeDetector, MLSDdetector, HEDdetector, MidasDetector
+   from controlnet_aux import CannyDetector, OpenposeDetector, MLSDdetector, HEDdetector, MidasDetector
 
-  detector_kwargs = dict({
-  #   "low_threshold": 100,
-  #    "high_threshold": 200,
-  })
-  #detector_model = CannyDetector() #HEDdetector.from_pretrained("lllyasviel/ControlNet")
-  detector_model = HEDdetector.from_pretrained("lllyasviel/ControlNet")
-  controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed", torch_dtype=torch.float16)
+  if controlnet == 'canny':
+    detector_kwargs = dict({
+      "low_threshold": 100,
+      "high_threshold": 200,
+    })
+    detector_model = CannyDetector()
+    controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-canny", torch_dtype=torch.float16)
+  elif controlnet == 'openpose':
+    detector_kwargs = dict()
+    detector_model = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+    controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-openpose", torch_dtype=torch.float16)
+  elif controlnet == 'midas':
+    detector_kwargs = dict()
+    detector_model = MidasDetector.from_pretrained("lllyasviel/ControlNet")
+    controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-midas", torch_dtype=torch.float16)
+  elif controlnet == 'normal':
+    detector_kwargs = dict()
+    detector_model = MLSDdetector.from_pretrained("lllyasviel/ControlNet")
+    controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-mlsd", torch_dtype=torch.float16)
+  elif controlnet == 'hed':
+    detector_kwargs = dict()
+    detector_model = HEDdetector.from_pretrained("lllyasviel/ControlNet")
+    controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed", torch_dtype=torch.float16)
 
   pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
     "runwayml/stable-diffusion-v1-5",
-    controlnet=controlnet,
+    controlnet=controlnet_model,
     torch_dtype=torch.float16
   )
 
@@ -108,7 +138,7 @@ def main(input_video, output_video, prompt, negative_prompt, num_inference_steps
 
     print(f"Processing frame {framenum} {input_frame.width}x{input_frame.height} shape={np.asarray(input_frame).shape}...")
 
-    generator = None #torch.manual_seed(0)
+    generator = None
 
     if fix_orientation:
       input_frame = input_frame.resize((input_frame.height//256*128, input_frame.width//256*128), PIL.Image.BICUBIC)
@@ -126,63 +156,25 @@ def main(input_video, output_video, prompt, negative_prompt, num_inference_steps
 
     # if we have a previous frame, transfer motion from the input to the output and blend with the noise
     if prev_input_frame != None:
-      # Calculates dense optical flow of input by Farneback method
-      #flow = cv2.calcOpticalFlowFarneback(prev_input_gray, input_gray, flow, 0.5, 3, 15, 3, 5, 1.2, 0)
-      # apply the flow to the previous output frame to get the predicted next output frame
-      #prev_output = np.asarray(prev_output_frame)
-      #print(f'input_gray.shape="{input_gray.shape}", min={np.min(input_gray)}, max={np.max(input_gray)}')
-      #print(f'prev_output_frame.shape="{prev_output_frame.shape}", min={np.min(prev_output_frame)}, max={np.max(prev_output_frame)}')
       predicted_output_frame, flow = transfer_motion(prev_input_frame, input_frame, prev_output_frame, flow)
-      predicted_output_frame.save("predicted_output_frame.png")
-      print(f"predicted_output_frame.shape={predicted_output_frame.size}")
-      print(f"flow.shape={flow.shape}, minx={np.min(flow[:,:,0])}, maxx={np.max(flow[:,:,0])}, miny={np.min(flow[:,:,1])}, maxy={np.max(flow[:,:,1])}")
-      """
-      defheight, defwidth = pipe._default_height_width(None, None, input_frame)
-      print(f'default WxH: {defwidth}x{defheight}')
-      # convert the predicted output frame to latent
-      predicted_output_frame = preprocess(predicted_output_frame)
-      noisy_latent, orig_latent, noise = prepare_latents(pipe, predicted_output_frame, get_timesteps(pipe, num_inference_steps, consistency_weight, pipe._execution_device)[0], generator=generator)
-      predicted_output_frame = predicted_output_frame.to(device=pipe.vae.device, dtype=torch.float16)
-      predicted_output_frame = torch.nn.functional.interpolate(predicted_output_frame, size=(height // pipe.vae_scale_factor // 256 * 128, width // pipe.vae_scale_factor // 256 * 128) )
-      predicted_output_latent = pipe.vae.encode(predicted_output_frame)
-      # blend the latent with the noise using linear interpolation according to consistency_weight
-      noisy_latent = (1 - consistency_weight) * noisy_latent + consistency_weight * predicted_output_latent
-      """
-      '''
-      # 5. set timesteps
-      batch_size = 1
-      num_images_per_prompt = 1
-      pipe.scheduler.set_timesteps(num_inference_steps, device=pipe.device)
-      timesteps, num_inference_steps = pipe.get_timesteps(num_inference_steps, consistency_strength, pipe.device)
-      latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
-      
-      # 6. Prepare latent variables
-      num_channels_latents = pipe.unet.in_channels
-      latents = prepare_latents(
-          preprocess(PIL.Image.fromarray(np.uint8(predicted_output_frame)).convert("RGB")),
-          latent_timestep,
-          batch_size * num_images_per_prompt,
-          num_channels_latents,
-          height,
-          width,
-          pipe.dtype,
-          pipe.device,
-          generator,
-          latents,
-      )
-      '''
-      
     else:
       predicted_output_frame = None #PIL.Image.new("RGB", (width, height), 'black')
     
-    if predicted_output_frame != None:
-      print(f'predicted_output_frame WxH: "{predicted_output_frame.width}x{predicted_output_frame.height}"')
-    print(f'input_frame WxH: "{input_image.width}x{input_image.height}"')
+    #if predicted_output_frame != None:
+    #  print(f'predicted_output_frame WxH: "{predicted_output_frame.width}x{predicted_output_frame.height}"')
+    #print(f'input_frame WxH: "{input_image.width}x{input_image.height}"')
 
-    input_image.save("input_image.png")
+    #input_image.save("input_image.png")
     control_image = detector_model(input_image, **detector_kwargs).convert("RGB")
-    control_image.save("control_image.png")
+    #control_image.save("control_image.png")
     #predicted_output_frame.save("predicted_output_frame.png")
+
+    if predicted_output_frame == None:
+      strength = feedthrough_strength * init_image_strength
+      init_image = input_image.copy()
+    else:
+      strength = init_image_strength
+      init_image = PIL.Image.blend(input_image, predicted_output_frame, 1.0 - feedthrough_strength)
 
     # run the pipeline
     output_frame = pipe(
@@ -194,18 +186,26 @@ def main(input_video, output_video, prompt, negative_prompt, num_inference_steps
       #latents=noisy_latent,
       controlnet_conditioning_image=control_image,
       controlnet_conditioning_scale=controlnet_strength,
-      image = predicted_output_frame if prev_output_frame != None else PIL.Image.new("RGB", (width, height), 'gray'),
-      strength = (1.0 - consistency_strength) if prev_output_frame != None else 1.0
+      image = init_image,
+      strength = 1.0 - strength
     ).images[0]
 
-    output_frame.save("frame.png")
+    final_frame = stackh( list( 
+                         list([input_image] if show_input else []) + 
+                         list([control_image] if show_detector else []) +
+                         list([output_frame] if show_output else [])) )
+
+    if save_intermediate_frames != None:
+      final_frame.save(save_intermediate_frames.format(framenum)),
+    #output_frame.save("frame.png")
     prev_input_frame = input_image.copy()
     prev_input_gray = input_gray
     prev_output_frame = output_frame.copy()
     prev_predicted_output_frame = predicted_output_frame
-    return output_frame
+    return final_frame
   
   process_frames(input_video, output_video, frame_filter)
 
 if __name__ == "__main__":
   main()
+
