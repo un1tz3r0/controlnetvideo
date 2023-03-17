@@ -1,10 +1,33 @@
-Some experiments with applying Stable Diffusion Img2Img filtering to video, investigating how to stabilize the output. This CLI script uses ControlNet to transform input frames of a clip along with img2img and dense optical flow to supply information from the previous output frame as initial latents for img2img, blended with 'feedthrough' direct init latent initialisation from the input frames, to provide greater interframe consistency and less temporal artifacting than previous methods. 
+A CLI tool for applying Stable Diffusion Img2Img with ControlNets to videos, with stabilization provided by feeding back the prior output frame as a partial init image. The input frames are fed in as the ControlNet control image through the appropriate detector.
 
 # Example
 
-`python3 controlnetvideo.py ~/Downloads/PXL_20220309_213229996.TS.mp4 out.mp4 --controlnet hed --steps 20 \
+Process a video using HED ouline detection...
+
+```
+python3 controlnetvideo.py ~/Downloads/PXL_20220309_213229996.TS.mp4 out.mp4 --controlnet hed --steps 20 \
 		--prompt 'a cute white cat with black patches watching a snowstorm out a window in a cozy apartment overlooking an intersection during a blizzard in the style of pusheen' \
-		--prompt-strength 6 --show-input --show-detector --dump-frames frame.png --init-image-strength 0.55 --feedthrough-strength 0.1 --min-dimension 512 --round-dims-to 128`
+		--prompt-strength 6 --show-input --show-detector --dump-frames frame.png --init-image-strength 0.55 --feedthrough-strength 0.1 --min-dimension 512 --round-dims-to 128
+```
+
+Process the same video using 
+
+```
+python controlnetvideo.py \
+	~/Downloads/PXL_20220309_213229996.TS.mp4 \
+	out-graffuturism.mp4 \
+	--controlnet depth \
+	--steps 20 \
+	--prompt 'graffuturism' \
+	--prompt-strength 10 \
+	--show-input \
+	--show-detector \
+	--dump-frames frame.png \
+	--init-image-strength 0.35 \
+	--feedthrough-strength 0.00 \
+	--min-dimension 512 \
+	--round-dims-to 128
+```
 
 # Usage
 

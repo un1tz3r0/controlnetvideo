@@ -14,7 +14,8 @@ from PIL import Image
 from diffusers import ControlNetModel, UniPCMultistepScheduler
 from stable_diffusion_controlnet_img2img import StableDiffusionControlNetImg2ImgPipeline
 from typing import Tuple, List, FrozenSet, Sequence, MutableSequence, Mapping, Optional, Any, Type, Union
-from controlnet_aux import CannyDetector, OpenposeDetector, MLSDdetector, HEDdetector, MidasDetector
+from controlnet_aux import CannyDetector, OpenposeDetector, MLSDdetector, HEDdetector#, MidasDetector
+from annotator.midas import MidasDetector
 
 def transfer_motion(srcframe1, srcframe2, destframe, flow:Optional[np.ndarray] = None) -> \
     Tuple[PIL.Image.Image, np.ndarray]:
@@ -48,13 +49,14 @@ def transfer_motion(srcframe1, srcframe2, destframe, flow:Optional[np.ndarray] =
 class MidasDetectorWrapper:
   ''' a wrapper around the midas detector model which allows 
   choosing either the depth or the normal output on creation '''
-  def __init__(self, model=None, model_type="dpt_hybrid", output_index=0, **kwargs):
-    self.model = model if model != None else MidasDetector(model_type=model_type)
+  def __init__(self, output_index=0, **kwargs):
+    self.model = MidasDetector()
     self.output_index = output_index
     self.default_kwargs = dict(kwargs)
   def __call__(self, image, **kwargs):
     ka = dict(list(self.default_kwargs.items()) + list(kwargs.items()))
-    return self.model(image, **ka)[self.output_index]
+    #return torch.tensor(self.model(np.asarray(image), **ka)[self.output_index][None, :, :].repeat(3,0)).unsqueeze(0)
+    return PIL.Image.fromarray(self.model(np.asarray(image), **ka)[self.output_index]).convert("RGB")
 
 
 class NormalDetector:
@@ -93,6 +95,20 @@ class NormalDetector:
 
 
 def stackh(images):
+  def topil(image):
+    if isinstance(image, PIL.Image.Image):
+      return image
+    elif isinstance(image, np.ndarray):
+      return PIL.Image.fromarray(image)
+    elif isinstance(image, torch.Tensor):
+      while image.ndim > 3 and image.shape[0] == 1:
+        image = image[0]
+      if image.ndim == 3 and image.shape[0] in [3, 1]:
+        image = image.permute(1, 2, 0)
+      return PIL.Image.fromarray(image.numpy())
+    else:
+      raise ValueError(f"cannot convert {type(image)} to PIL.Image.Image")
+  images = [topil(image) for image in images]
   cellh = max([image.height for image in images])
   cellw = max([image.width for image in images])
   result = PIL.Image.new("RGB", (cellw * len(images), cellh), "black")
@@ -146,17 +162,18 @@ def textbox(s, font, color, padding=(1,1,1,1), border=(0,0,0,0), corner_radius=(
 def rgbtohsl(rgb:np.ndarray):
   r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
   r, g, b = r / 255.0, g / 255.0, b / 255.0
-  mx = np.amax([r, g, b])
-  mn = np.amin([r, g, b])
+  mx = np.amax([r, g, b], 2)
+  mn = np.amin([r, g, b], 2)
   df = mx-mn
-  if mx == mn: h = 0
-  elif mx == r: h = (60 * ((g-b)/df) + 360) % 360
-  elif mx == g: h = (60 * ((b-r)/df) + 120) % 360
-  elif mx == b: h = (60 * ((r-g)/df) + 240) % 360
-  if mx == 0: s = 0
-  else: s = df/mx
+  h = np.zeros(r.shape)
+  h[g > r] = (60 * ((g[g>r]-b[g>r])/df[g>r]) + 360) % 360
+  h[b > g] = (60 * ((b[b>g]-r[b>g])/df[b>g]) + 240) % 360
+  h[r > b] = (60 * ((r[r>b]-g[r>b])/df[r>b]) + 120) % 360
+  h[r == g == b] = 0
+  s = np.zeros(r.shape)
+  s[mx != 0] = df/mx
   l = (mx+mn)/2
-  return np.array([h, s, l])
+  return np.ndarray([h, s, l])
 
 def brightcontrastmatch(source, template):
   oldshape = source.shape
@@ -182,7 +199,7 @@ def avghuesatmatch(source, template):
   s_hue = (s_hue - s_hue_mean) * (t_hue_std / s_hue_std) + t_hue_mean
   s_sat = (s_sat - s_sat_mean) * (t_sat_std / s_sat_std) + t_sat_mean
   s_hsl[:,0], s_hsl[:,1] = s_hue, s_sat
-  return (PIL.Image.fromarray(s_hsl, mode="HSL")).reshape(oldshape)
+  return (PIL.Image.fromarray(s_hsl.reshape(oldshape), mode="HSL")).convert(mode="RGB")
 
 def histomatch(source, template):
   oldshape = source.shape
@@ -197,6 +214,27 @@ def histomatch(source, template):
   interp_t_values = np.interp(s_quantiles, t_quantiles, t_values)
   return interp_t_values[bin_idx].reshape(oldshape)
 
+from skimage.exposure import match_histograms
+import cv2
+
+def maintain_colors(color_match_sample, prev_img, mode):
+    ''' adjust output frame to match histogram of first output frame, 
+    this is how deforum does it, big thanks to them '''
+    if mode == 'rgb':
+        return match_histograms(prev_img, color_match_sample, multichannel=True)
+    elif mode == 'hsv':
+        prev_img_hsv = cv2.cvtColor(prev_img, cv2.COLOR_RGB2HSV)
+        color_match_hsv = cv2.cvtColor(color_match_sample, cv2.COLOR_RGB2HSV)
+        matched_hsv = match_histograms(prev_img_hsv, color_match_hsv, multichannel=True)
+        return cv2.cvtColor(matched_hsv, cv2.COLOR_HSV2RGB)
+    elif mode == 'lab':
+        prev_img_lab = cv2.cvtColor(prev_img, cv2.COLOR_RGB2LAB)
+        color_match_lab = cv2.cvtColor(color_match_sample, cv2.COLOR_RGB2LAB)
+        matched_lab = match_histograms(prev_img_lab, color_match_lab, multichannel=True)
+        return cv2.cvtColor(matched_lab, cv2.COLOR_LAB2RGB)
+    else:
+        raise ValueError('Invalid color mode')
+    
 # ----------------------------------------------------------------------------------------------
 
 def process_frames(input_video, output_video, wrapped, start_time=None, end_time=None, duration=None, max_dimension=None, min_dimension=None, round_dims_to=None, fix_orientation=False):
@@ -232,17 +270,36 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
     if duration != None:
       video = video.subclip(0, duration)
     # Create a new video with the processed frames
+    from time import monotonic
     processed_video = None
     try:
-      processed_video = mp.ImageSequenceClip([
-        np.array(wrapped(framenum, Image.fromarray(frame).resize((w,h)))) 
-          for framenum, frame in 
-            enumerate(tqdm(video.iter_frames()))
-        ], fps=video.fps)
+      framenum = 0
+      starttime = monotonic()
+      def wrapper(gf, t):
+        nonlocal framenum
+        nonlocal starttime
+        elapsed = monotonic() - starttime
+        if t > 0:
+          eta = (video.duration / t) * elapsed
+        else:
+          eta = 0
+        print(f"Processing frame {framenum} at time {t}/{video.duration} seconds... {elapsed:.2f}s elapsed, {eta:.2f}s estimated time remaining")
+        result = wrapped(framenum, PIL.Image.fromarray(gf(t)).resize((w,h)))
+        framenum = framenum + 1
+        return np.asarray(result)
+      
+      #video.fx(wrapper).write_videofile(output_video)
+      video.fl(wrapper, keep_duration=True).write_videofile(output_video)
+      #processed_video = mp.ImageSequenceClip([
+      #  np.array(wrapped(framenum, Image.fromarray(frame).resize((w,h)))) 
+      #    for framenum, frame in 
+      #      enumerate(tqdm(video.iter_frames()))
+      #  ], fps=video.fps)
     finally:
       # save the video
-      if processed_video != None:
-        processed_video.write_videofile(output_video)
+      #if processed_video != None:
+      #  processed_video.write_videofile(output_video)
+      video.close()
 
 @click.command()
 @click.argument('input_video', type=click.Path(exists=True))
@@ -284,7 +341,7 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
     controlnet_model = ControlNetModel.from_pretrained("fusing/stable-diffusion-v1-5-controlnet-openpose", torch_dtype=torch.float16)
   elif controlnet == 'depth':
     detector_kwargs = dict({'bg_th': 0.1})
-    detector_model = MidasDetectorWrapper(model_type="dpt_hybrid") #MidasDetectorWrapper(None, 0)
+    detector_model = MidasDetectorWrapper() #(model_type="dpt_hybrid") #MidasDetectorWrapper(None, 0)
     controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-depth", torch_dtype=torch.float16)
   elif controlnet == 'mlsd':
     detector_kwargs = dict()
@@ -315,6 +372,7 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
   pipe.enable_model_cpu_offload()
   pipe.run_safety_checker = lambda image, text_embeds, text_embeds_negative: (image, False)
 
+  first_output_frame = None
   prev_input_frame = None
   prev_output_frame = None
   prev_input_gray = None
@@ -327,6 +385,7 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
     nonlocal prev_input_gray
     nonlocal prev_output_frame
     nonlocal prev_predicted_output_frame
+    nonlocal first_output_frame
     nonlocal flow
 
     #print(f"Processing frame {framenum} {input_frame.width}x{input_frame.height} shape={np.asarray(input_frame).shape}...")
@@ -376,6 +435,11 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
       image = init_image,
       strength = 1.0 - strength,
     ).images[0]
+
+    if first_output_frame == None:
+      first_output_frame = output_frame.copy()
+    else:
+      output_frame = PIL.Image.fromarray(maintain_colors(np.asarray(first_output_frame), np.asarray(output_frame), 'lab'))
 
     final_frame = stackh( list( 
                          list([input_image] if show_input else []) + 
