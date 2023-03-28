@@ -46,6 +46,16 @@ def transfer_motion(srcframe1, srcframe2, destframe, flow:Optional[np.ndarray] =
 
   return PIL.Image.fromarray(warped), flow
 
+def flow_to_image(flow):
+  ''' convert dense optical flow to image, direction -> hue, magnitude -> brightness '''
+  hsv = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
+  hsv[...,1] = 255
+  mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+  hsv[...,0] = ang*180/np.pi/2
+  hsv[...,2] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX)
+  rgb = cv2.cvtColor(hsv,cv2.COLOR_HSV2BGR)
+  return PIL.Image.fromarray(rgb)
+
 class MidasDetectorWrapper:
   ''' a wrapper around the midas detector model which allows 
   choosing either the depth or the normal output on creation '''
@@ -59,25 +69,12 @@ class MidasDetectorWrapper:
     return PIL.Image.fromarray(self.model(np.asarray(image), **ka)[self.output_index]).convert("RGB")
 
 
-class NormalDetector:
-  def __init__(self, bg_threshold=0.4):
-    raise NotImplementedError("NormalDetector is not working yet")
-    from transformers import pipeline
-    self.depth_estimator = pipeline("depth-estimation", model ="Intel/dpt-hybrid-midas" )
-    self.bg_threshold = bg_threshold
-  
-  def __call__(self, image, bg_threshold=None):
-    if bg_threshold is None:
-      bg_threshold = self.bg_threshold
-    
-    image = self.depth_estimator(image)['predicted_depth'][0]
-    image = image.numpy()
-
+def depth_to_normal(image):
     image_depth = image.copy()
     image_depth -= np.min(image_depth)
     image_depth /= np.max(image_depth)
 
-    bg_threhold = self.bg_threshold
+    bg_threhold = 0.1
 
     x = cv2.Sobel(image, cv2.CV_32F, 1, 0, ksize=3)
     x[image_depth < bg_threhold] = 0
@@ -93,21 +90,33 @@ class NormalDetector:
     image = Image.fromarray(image)
     return image
 
+def padto(image, width, height, gravityx=0.5, gravityy=0.5):
+  import PIL.ImageOps, PIL.Image
+  ''' pad image to width and height '''
+  image = PIL.Image.fromarray(image)
+  if image.size[0] < width:
+    image = PIL.ImageOps.expand(image, border=(int((width - image.size[0]) / 2), 0, 0, 0), fill=0)
+  if image.size[1] < height:
+    image = PIL.ImageOps.expand(image, border=(0, int((height - image.size[1]) / 2), 0, 0), fill=0)
+  return image
+
+def topil(image):
+  # convert to PIL.Image.Image from various types
+  if isinstance(image, PIL.Image.Image):
+    return image
+  elif isinstance(image, np.ndarray):
+    return PIL.Image.fromarray(image)
+  elif isinstance(image, torch.Tensor):
+    while image.ndim > 3 and image.shape[0] == 1:
+      image = image[0]
+    if image.ndim == 3 and image.shape[0] in [3, 1]:
+      image = image.permute(1, 2, 0)
+    return PIL.Image.fromarray(image.numpy())
+  else:
+    raise ValueError(f"cannot convert {type(image)} to PIL.Image.Image")
 
 def stackh(images):
-  def topil(image):
-    if isinstance(image, PIL.Image.Image):
-      return image
-    elif isinstance(image, np.ndarray):
-      return PIL.Image.fromarray(image)
-    elif isinstance(image, torch.Tensor):
-      while image.ndim > 3 and image.shape[0] == 1:
-        image = image[0]
-      if image.ndim == 3 and image.shape[0] in [3, 1]:
-        image = image.permute(1, 2, 0)
-      return PIL.Image.fromarray(image.numpy())
-    else:
-      raise ValueError(f"cannot convert {type(image)} to PIL.Image.Image")
+  ''' stack images horizontally, using the largest image's height for all images '''
   images = [topil(image) for image in images]
   cellh = max([image.height for image in images])
   cellw = max([image.width for image in images])
@@ -118,8 +127,8 @@ def stackh(images):
   return result
 
 def expanddims(*sides):
-  from typing import Tuple, Iterable, String
-  if not (isinstance(sides, Iterable) and not isinstance(sides, String)):
+  from typing import Tuple, Iterable, ByteString
+  if not (isinstance(sides, Iterable) and not isinstance(sides, (str, ByteString))):
     sides = [sides]
   if len(sides) == 1:
     sides = [sides[0], sides[0], sides[0], sides[0]]
@@ -154,26 +163,62 @@ def roundrect(size, radius:Tuple[int,int,int,int], border:Tuple[int,int,int,int]
   return result
 
 def textbox(s, font, color, padding=(1,1,1,1), border=(0,0,0,0), corner_radius=(2,2,2,2), background_color="white", border_color="black"):
-  text = PIL.Image.new('RGBA', fontgetsize(str), background_color)
+  import PIL.Image, PIL.ImageDraw
+  def fontgetsize(s):
+    draw=PIL.ImageDraw.Draw(PIL.Image.new('RGBA', (1,1), background_color))
+    return draw.textsize(s, font=font)
+  text = PIL.Image.new('RGBA', fontgetsize(s), background_color)
   draw = PIL.ImageDraw.Draw(text)
-  draw.text((0, 0), str, font=font, fill=color)
+  draw.text((0, 0), s, font=font, fill=color)
   return text
 
 def rgbtohsl(rgb:np.ndarray):
+  if rgb.dtype == np.uint8:
+    rgb = rgb.astype(np.float32) / 255.0
   r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
-  r, g, b = r / 255.0, g / 255.0, b / 255.0
-  mx = np.amax([r, g, b], 2)
-  mn = np.amin([r, g, b], 2)
+  #r, g, b = r / 255.0, g / 255.0, b / 255.0
+  mx = np.amax(rgb, 2)
+  mn = np.amin(rgb, 2)
   df = mx-mn
   h = np.zeros(r.shape)
   h[g > r] = (60 * ((g[g>r]-b[g>r])/df[g>r]) + 360) % 360
   h[b > g] = (60 * ((b[b>g]-r[b>g])/df[b>g]) + 240) % 360
   h[r > b] = (60 * ((r[r>b]-g[r>b])/df[r>b]) + 120) % 360
-  h[r == g == b] = 0
+  # h[r == g == b] = 0
   s = np.zeros(r.shape)
-  s[mx != 0] = df/mx
+  s[np.nonzero(mx)] = df[np.nonzero(mx)]/mx[np.nonzero(mx)]
+  l = np.zeros(r.shape)
   l = (mx+mn)/2
-  return np.ndarray([h, s, l])
+  hsl = np.zeros(rgb.shape)
+  hsl[:,:,0] = h
+  hsl[:,:,1] = s
+  hsl[:,:,2] = l
+  return hsl #np.ndarray([h, s, l])
+
+def hsltorgb(hsl:np.ndarray):
+  h, s, l = hsl[:,:,0], hsl[:,:,1], hsl[:,:,2]
+  c = (1 - np.abs(2*l-1)) * s
+  h = h / 60
+  x = c * (1 - np.abs(h % 2 - 1))
+  m = l - c/2
+  r = np.zeros(h.shape)
+  g = np.zeros(h.shape)
+  b = np.zeros(h.shape)
+  r[h < 1] = c[h < 1]
+  r[h >= 1] = x[h >= 1]
+  g[h < 1] = x[h < 1]
+  g[h >= 2] = c[h >= 2]
+  b[h < 2] = c[h < 2]
+  b[h >= 3] = x[h >= 3]
+  r[h >= 4] = c[h >= 4]
+  g[h >= 4] = x[h >= 4]
+  r += m
+  g += m
+  b += m
+  r *= 255
+  g *= 255
+  b *= 255
+  return np.ndarray([r, g, b])
 
 def brightcontrastmatch(source, template):
   oldshape = source.shape
@@ -185,6 +230,8 @@ def brightcontrastmatch(source, template):
   return source.reshape(oldshape)
 
 def avghuesatmatch(source, template):
+  source = np.asarray(source)
+  template = np.asarray(template)
   oldshape = source.shape
   source = source.ravel()
   template = template.ravel()
@@ -230,19 +277,21 @@ def maintain_colors(color_match_sample, prev_img, mode):
     elif mode == 'lab':
         prev_img_lab = cv2.cvtColor(prev_img, cv2.COLOR_RGB2LAB)
         color_match_lab = cv2.cvtColor(color_match_sample, cv2.COLOR_RGB2LAB)
-        matched_lab = match_histograms(prev_img_lab, color_match_lab, multichannel=True)
+        matched_lab = match_histograms(prev_img_lab, color_match_lab, multichannel=True )
         return cv2.cvtColor(matched_lab, cv2.COLOR_LAB2RGB)
     else:
         raise ValueError('Invalid color mode')
     
 # ----------------------------------------------------------------------------------------------
 
-def process_frames(input_video, output_video, wrapped, start_time=None, end_time=None, duration=None, max_dimension=None, min_dimension=None, round_dims_to=None, fix_orientation=False):
+def process_frames(input_video, output_video, wrapped, start_time=None, end_time=None, duration=None, max_dimension=None, min_dimension=None, round_dims_to=None, fix_orientation=False, ):
     from moviepy import editor as mp
     from PIL import Image
     from tqdm import tqdm
+
     # Load the video
     video = mp.VideoFileClip(input_video)
+ 
     # scale the video frames if a min/max size is given
     if fix_orientation:
       h, w = video.size
@@ -254,14 +303,17 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
         w, h = max_dimension, int(h / w * max_dimension)
       else:
         w, h = int(w / h * max_dimension), max_dimension
+
     if min_dimension != None:
       if w < h:
         w, h = min_dimension, int(h / w * min_dimension)
       else:
         w, h = int(w / h * min_dimension), min_dimension
+
     if round_dims_to is not None:
       w = round_dims_to * (w // round_dims_to)
       h = round_dims_to * (h // round_dims_to)
+    
     # set the start and end time and duration to process if given
     if end_time is not None:
       video = video.subclip(0, end_time)
@@ -269,9 +321,9 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
       video = video.subclip(start_time)
     if duration != None:
       video = video.subclip(0, duration)
+    
     # Create a new video with the processed frames
     from time import monotonic
-    processed_video = None
     try:
       framenum = 0
       starttime = monotonic()
@@ -307,26 +359,34 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.option('--start-time', type=Optional[Union[float, str]], default=None, help="start time in seconds")
 @click.option('--end-time', type=Optional[Union[float, str]], default=None, help="end time in seconds")
 @click.option('--duration', type=Optional[Union[float, str]], default=None, help="duration in seconds")
-@click.option('--max-dimension', type=int, default=None, help="maximum dimension of the video")
-@click.option('--min-dimension', type=int, default=None, help="minimum dimension of the video")
-@click.option('--round-dims-to', type=int, default=None, help="round the dimensions to the nearest multiple of this number")
+@click.option('--max-dimension', type=int, default=832, help="maximum dimension of the video")
+@click.option('--min-dimension', type=int, default=512, help="minimum dimension of the video")
+@click.option('--round-dims-to', type=int, default=128, help="round the dimensions to the nearest multiple of this number")
 @click.option('--prompt', type=str, default=None, help="prompt used to guide the denoising process")
 @click.option('--negative-prompt', type=str, default=None, help="negative prompt, can be used to prevent the model from generating certain words")
-@click.option('--prompt-strength', type=float, default=7.0, help="how much influence the prompt has on the output")
+@click.option('--prompt-strength', type=float, default=7.5, help="how much influence the prompt has on the output")
 #@click.option('--scheduler', type=click.Choice(['default']), default='default', help="which scheduler to use")
-@click.option('--num-inference-steps', '--steps', type=int, default=10, help="number of inference steps, depends on the scheduler, trades off speed for quality. 20-50 is a good range from fastest to best.")
-@click.option('--controlnet', type=click.Choice(['hed', 'canny', 'scribble', 'openpose', 'depth', 'normal', 'mlsd']), default='hed', help="which pretrained controlnet annotator to use")
+@click.option('--num-inference-steps', '--steps', type=int, default=25, help="number of inference steps, depends on the scheduler, trades off speed for quality. 20-50 is a good range from fastest to best.")
+@click.option('--controlnet', type=click.Choice(['aesthetic', 'hed', 'canny', 'scribble', 'openpose', 'depth', 'normal', 'mlsd']), default='hed', help="which pretrained controlnet annotator to use")
 @click.option('--controlnet-strength', type=float, default=1.0, help="how much influence the controlnet annotator's output is used to guide the denoising process")
-@click.option('--fix-orientation', is_flag=True, default=True, help="resize videos shot in portrait mode on some devices to fix incorrect aspect ratio bug")
+@click.option('--fix-orientation/--no-fix-orientation', is_flag=True, default=True, help="resize videos shot in portrait mode on some devices to fix incorrect aspect ratio bug")
 @click.option('--init-image-strength', type=float, default=0.5, help="the init-image strength, or how much of the prompt-guided denoising process to skip in favor of starting with an existing image")
-@click.option('--feedthrough-strength', type=float, default=0.0, help="the init-image is composed by transferring motion from the input video onto each output frame, and blending it optionally with the frame input that is sent to the controlnet detector")
+@click.option('--feedthrough-strength', type=float, default=0.0, help="the ratio of input to motion compensated prior output to feed through to the next frame")
 @click.option('--show-detector', is_flag=True, default=False, help="show the controlnet detector output")
 @click.option('--show-input', is_flag=True, default=False, help="show the input frame")
 @click.option('--show-output', is_flag=True, default=True, help="show the output frame")
-@click.option('--show-flow', is_flag=True, default=False, help="show the motion transfer (not implemented yet)")
-@click.option('--dump-frames', type=click.Path(), default=None, help="write frames to a file during processing to visualise progress. may contain {} placeholder for frame number")
-def main(input_video, output_video, start_time, end_time, duration, max_dimension, min_dimension, round_dims_to, prompt, negative_prompt, prompt_strength, num_inference_steps, controlnet, controlnet_strength, fix_orientation, init_image_strength, feedthrough_strength, show_detector, show_input, show_output, show_flow, dump_frames):   
+@click.option('--show-motion', is_flag=True, default=False, help="show the motion transfer (not implemented yet)")
+@click.option('--dump-frames', type=click.Path(), default=None, help="write intermediate dump images to a file/files during processing to visualise progress. may contain {} placeholder for frame number")
+@click.option('--dump-video', is_flag=True, default=False, help="write intermediate dump images to the final video instead of just the final output image")
+@click.option('--color-fix', type=click.Choice(['none', 'rgb', 'hsv', 'lab']), default='lab', help="prevent color from drifting due to feedback and model bias by fixing the histogram to the first frame. specify colorspace for histogram matching, e.g. 'rgb' or 'hsv' or 'lab', or 'none' to disable.")
+@click.option('--color-info', is_flag=True, default=False, help="print extra stats about the color content of the output to help debug color drift issues")
+def main(input_video, output_video, start_time, end_time, duration, max_dimension, min_dimension, round_dims_to, prompt, negative_prompt, prompt_strength, num_inference_steps, controlnet, controlnet_strength, fix_orientation, init_image_strength, feedthrough_strength, show_detector, show_input, show_output, show_motion, dump_frames, dump_video, color_fix, color_info):   
   # run controlnet pipeline on video
+
+  # choose controlnet model and detector based on the --controlnet option
+  # this also affects the default scheduler and the stable diffusion model version required, in the case of aesthetic controlnet
+  scheduler = 'unipc'
+  sdmodel = 'runwayml/stable-diffusion-v1-5'
 
   if controlnet == 'canny':
     detector_kwargs = dict({
@@ -340,8 +400,8 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
     detector_model = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
     controlnet_model = ControlNetModel.from_pretrained("fusing/stable-diffusion-v1-5-controlnet-openpose", torch_dtype=torch.float16)
   elif controlnet == 'depth':
-    detector_kwargs = dict({'bg_th': 0.1})
-    detector_model = MidasDetectorWrapper() #(model_type="dpt_hybrid") #MidasDetectorWrapper(None, 0)
+    detector_kwargs = dict()
+    detector_model = MidasDetectorWrapper()
     controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-depth", torch_dtype=torch.float16)
   elif controlnet == 'mlsd':
     detector_kwargs = dict()
@@ -353,21 +413,31 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
     controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed", torch_dtype=torch.float16)
   elif controlnet == 'normal':
     detector_kwargs = dict()
-    detector_model = MidasDetectorWrapper(None, 1)
-    #detector_model = NormalDetector()
+    detector_model = MidasDetectorWrapper(1)
     controlnet_model = ControlNetModel.from_pretrained("fusing/stable-diffusion-v1-5-controlnet-normal", torch_dtype=torch.float16)
+  elif controlnet == 'aesthetic':
+    detector_kwargs = dict({
+      "low_threshold": int(255//(3/1)),
+      "high_threshold": int(255//(3/2))
+    })
+    detector_model = CannyDetector()
+    controlnet_model = None
+    sdmodel = "krea/aesthetic-controlnet"
   else:
     raise NotImplementedError("controlnet type not implemented")
   
-  pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5",
-    controlnet=controlnet_model,
-    torch_dtype=torch.float16
-  )
+  # instantiate the pipeline
+  if controlnet_model != None:
+    pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(sdmodel, controlnet=controlnet_model, torch_dtype=torch.float16)
+  else:
+    pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(sdmodel, torch_dtype=torch.float16)
 
-  #if scheduler.lower().startswith("unipcm"):
-  pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-  
+  # set the scheduler... this is a bit hacky but it works
+  if scheduler == 'unipcm':
+    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+  elif scheduler == 'eulera':
+    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+
   pipe.enable_xformers_memory_efficient_attention()
   pipe.enable_model_cpu_offload()
   pipe.run_safety_checker = lambda image, text_embeds, text_embeds_negative: (image, False)
@@ -412,7 +482,7 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
     else:
       predicted_output_frame = None 
     
-    control_image = detector_model(input_image, **detector_kwargs)
+    control_image = detector_model(input_image, **detector_kwargs).convert("RGB")
     ci = np.asarray(control_image)
     print(f"ci.shape={ci.shape} ci.min={ci.min()} ci.max={ci.max()} ci.mean={ci.mean()} ci.std={ci.std()}")
 
@@ -430,34 +500,53 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
       negative_prompt=negative_prompt, 
       num_inference_steps=num_inference_steps, 
       generator=generator,
-      controlnet_conditioning_image=control_image,
+      controlnet_conditioning_image=[control_image],
       controlnet_conditioning_scale=controlnet_strength,
       image = init_image,
       strength = 1.0 - strength,
     ).images[0]
 
-    if first_output_frame == None:
-      first_output_frame = output_frame.copy()
-    else:
-      output_frame = PIL.Image.fromarray(maintain_colors(np.asarray(first_output_frame), np.asarray(output_frame), 'lab'))
+    if color_fix != 'none':
+      if first_output_frame == None:
+        first_output_frame = output_frame.copy()
+      else:
+        output_frame = PIL.Image.fromarray(maintain_colors(np.asarray(first_output_frame), np.asarray(output_frame), color_fix))
 
-    final_frame = stackh( list( 
+    if show_motion:
+      if not (flow is None):
+        motion_image = flow_to_image(flow)
+      else:
+        motion_image = PIL.Image.new("RGB", (width, height), (0,0,0))
+    
+    if dump_frames != None or dump_video:
+      final_frame = stackh( list( 
                          list([input_image] if show_input else []) + 
+                         list([motion_image] if show_motion else []) +
                          list([control_image] if show_detector else []) +
                          list([output_frame] if show_output else [])) )
 
+    if color_info:
+      meanhslout = np.mean(rgbtohsl(np.asarray(output_frame)), axis = (0,1))
+      print(f"output color info: mean hue{meanhslout[0]}, mean sat={meanhslout[1]}, mean lum={meanhslout[2]}")
+      if not (prev_output_frame is None):
+        prevmeanhslout = np.mean(rgbtohsl(np.asarray(prev_output_frame)), axis = (0,1))
+        diffhslout = meanhslout - prevmeanhslout
+        print(f"output color diff: mean hue{diffhslout[0]}, mean sat={diffhslout[1]}, mean lum={diffhslout[2]}")
+
     if dump_frames != None:
-      final_frame.save(dump_frames.format(framenum)),
+      final_frame.save(dump_frames.format(framenum))
+
     #output_frame.save("frame.png")
     prev_input_frame = input_image.copy()
     prev_input_gray = input_gray
     prev_output_frame = output_frame.copy()
     prev_predicted_output_frame = predicted_output_frame
-    return final_frame
+    if dump_video:
+      return final_frame
+    else:
+      return output_frame
   
   process_frames(input_video, output_video, frame_filter, start_time, end_time, duration, max_dimension, min_dimension, round_dims_to, fix_orientation)
 
 if __name__ == "__main__":
   main()
-
-
