@@ -16,7 +16,7 @@ from diffusers.utils import (
     is_accelerate_available,
     is_accelerate_version,
     randn_tensor,
-    replace_example_docstring,
+    replace_example_docstring,                                                                                                                                                                                          
 )
 
 
@@ -553,7 +553,7 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline):
 
         return timesteps, num_inference_steps - t_start
 
-    def prepare_latents(self, image, timestep, batch_size, num_images_per_prompt, dtype, device, generator=None):
+    def prepare_latents(self, image, timestep, batch_size, num_images_per_prompt, dtype, device, generator=None, noise=None, blend_noise=None):
         if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
             raise ValueError(
                 f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
@@ -574,7 +574,9 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline):
             ]
             init_latents = torch.cat(init_latents, dim=0)
         else:
-            init_latents = self.vae.encode(image).latent_dist.sample(generator)
+            
+            latent_dist = self.vae.encode(image).latent_dist
+            init_latents = latent_dist.sample(generator)
 
         init_latents = self.vae.config.scaling_factor * init_latents
 
@@ -586,10 +588,24 @@ class StableDiffusionControlNetImg2ImgPipeline(DiffusionPipeline):
             init_latents = torch.cat([init_latents], dim=0)
 
         shape = init_latents.shape
-        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        new_noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+        if blend_noise is not None and noise is not None:
+            if isinstance(noise, list) and len(noise) == 1 and noise[0] != None:
+                new_noise = blend_noise * new_noise + (1 - blend_noise) * noise[0]
+
+        if noise == None:
+            noise=[new_noise]
+        elif isinstance(noise, list) and len(noise) == 0:
+            noise.append(new_noise)
+        else:
+            if isinstance(noise, list) and len(noise) == 1 and noise[0] == None:
+                noise[0] = new_noise
+            else:
+                noise = [new_noise]
 
         # get latents
-        init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
+        init_latents = self.scheduler.add_noise(init_latents, noise[0], timestep)
         latents = init_latents
 
         return latents
