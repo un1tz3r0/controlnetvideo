@@ -10,7 +10,7 @@ import torch
 import PIL.Image
 import cv2
 from PIL import Image
-from diffusers import ControlNetModel, UniPCMultistepScheduler
+from diffusers import ControlNetModel, UniPCMultistepScheduler, EulerAncestralDiscreteScheduler
 from stable_diffusion_controlnet_img2img import StableDiffusionControlNetImg2ImgPipeline
 from typing import Tuple, List, FrozenSet, Sequence, MutableSequence, Mapping, Optional, Any, Type, Union
 from controlnet_aux import CannyDetector, OpenposeDetector, MLSDdetector, HEDdetector, MidasDetector
@@ -482,9 +482,9 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.command()
 @click.argument('input_video', type=click.Path(exists=True))
 @click.argument('output_video', type=click.Path())
-@click.option('--start-time', type=Optional[Union[float, str]], default=None, help="start time in seconds")
-@click.option('--end-time', type=Optional[Union[float, str]], default=None, help="end time in seconds")
-@click.option('--duration', type=Optional[Union[float, str]], default=None, help="duration in seconds")
+@click.option('--start-time', type=float, default=None, help="start time in seconds")
+@click.option('--end-time', type=float, default=None, help="end time in seconds")
+@click.option('--duration', type=float, default=None, help="duration in seconds")
 @click.option('--max-dimension', type=int, default=832, help="maximum dimension of the video")
 @click.option('--min-dimension', type=int, default=512, help="minimum dimension of the video")
 @click.option('--round-dims-to', type=int, default=128, help="round the dimensions to the nearest multiple of this number")
@@ -493,7 +493,7 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.option('--prompt-strength', type=float, default=7.5, help="how much influence the prompt has on the output")
 #@click.option('--scheduler', type=click.Choice(['default']), default='default', help="which scheduler to use")
 @click.option('--num-inference-steps', '--steps', type=int, default=25, help="number of inference steps, depends on the scheduler, trades off speed for quality. 20-50 is a good range from fastest to best.")
-@click.option('--controlnet', type=click.Choice(['aesthetic', 'hed', 'canny', 'scribble', 'openpose', 'depth', 'normal', 'mlsd']), default='hed', help="which pretrained controlnet annotator to use")
+@click.option('--controlnet', type=click.Choice(['aesthetic', 'hed', 'hed21', 'canny', 'canny21', 'scribble', 'openpose', 'depth', 'depth21', 'normal', 'mlsd']), default='hed', help="which pretrained controlnet annotator to use")
 @click.option('--controlnet-strength', type=float, default=1.0, help="how much influence the controlnet annotator's output is used to guide the denoising process")
 @click.option('--fix-orientation/--no-fix-orientation', is_flag=True, default=True, help="resize videos shot in portrait mode on some devices to fix incorrect aspect ratio bug")
 @click.option('--init-image-strength', type=float, default=0.5, help="the init-image strength, or how much of the prompt-guided denoising process to skip in favor of starting with an existing image")
@@ -526,6 +526,14 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 		})
 		detector_model = CannyDetector()
 		controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-canny", torch_dtype=torch.float16)
+	elif controlnet == 'canny21':
+		detector_kwargs = dict({
+			"low_threshold": canny_low_thr if canny_low_thr != None else 50,
+			"high_threshold": canny_high_thr if canny_high_thr != None else 200
+		})
+		detector_model = CannyDetector()
+		controlnet_model = ControlNetModel.from_pretrained("thibaud/controlnet-sd21-canny-diffusers", torch_dtype=torch.float16)
+		sdmodel = 'stabilityai/stable-diffusion-2-1'
 	elif controlnet == 'openpose':
 		detector_kwargs = dict()
 		detector_model = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
@@ -534,6 +542,11 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 		detector_kwargs = dict()
 		detector_model = MidasDetectorWrapper()
 		controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-depth", torch_dtype=torch.float16)
+	elif controlnet == 'depth21':
+		detector_kwargs = dict()
+		detector_model = MidasDetectorWrapper()
+		controlnet_model = ControlNetModel.from_pretrained("thibaud/controlnet-sd21-depth-diffusers", torch_dtype=torch.float16)
+		sdmodel = 'stabilityai/stable-diffusion-2-1'
 	elif controlnet == 'mlsd':
 		detector_kwargs = dict({
 			'thr_v': 0.1 if mlsd_score_thr==None else mlsd_score_thr,
@@ -545,6 +558,11 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 		detector_kwargs = dict()
 		detector_model = HEDdetector.from_pretrained("lllyasviel/ControlNet")
 		controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed", torch_dtype=torch.float16)
+	elif controlnet == 'hed21':
+		detector_kwargs = dict()
+		detector_model = HEDdetector.from_pretrained("lllyasviel/ControlNet")
+		controlnet_model = ControlNetModel.from_pretrained("thibaud/controlnet-sd21-hed-diffusers", torch_dtype=torch.float16)
+		sdmodel = 'stabilityai/stable-diffusion-2-1'
 	elif controlnet == 'normal':
 		detector_kwargs = dict()
 		detector_model = MidasDetectorWrapper(1)
