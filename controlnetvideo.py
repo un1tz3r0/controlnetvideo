@@ -493,7 +493,7 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.option('--prompt-strength', type=float, default=7.5, help="how much influence the prompt has on the output")
 #@click.option('--scheduler', type=click.Choice(['default']), default='default', help="which scheduler to use")
 @click.option('--num-inference-steps', '--steps', type=int, default=25, help="number of inference steps, depends on the scheduler, trades off speed for quality. 20-50 is a good range from fastest to best.")
-@click.option('--controlnet', type=click.Choice(['aesthetic', 'hed', 'hed21', 'canny', 'canny21', 'scribble', 'openpose', 'depth', 'depth21', 'normal', 'mlsd']), default='hed', help="which pretrained controlnet annotator to use")
+@click.option('--controlnet', type=click.Choice(['aesthetic', 'lineart21', 'hed', 'hed21', 'canny', 'canny21', 'openpose', 'openpose21', 'depth', 'depth21', 'normal', 'mlsd']), default='hed', help="which pretrained controlnet annotator to use")
 @click.option('--controlnet-strength', type=float, default=1.0, help="how much influence the controlnet annotator's output is used to guide the denoising process")
 @click.option('--fix-orientation/--no-fix-orientation', is_flag=True, default=True, help="resize videos shot in portrait mode on some devices to fix incorrect aspect ratio bug")
 @click.option('--init-image-strength', type=float, default=0.5, help="the init-image strength, or how much of the prompt-guided denoising process to skip in favor of starting with an existing image")
@@ -538,6 +538,11 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 		detector_kwargs = dict()
 		detector_model = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
 		controlnet_model = ControlNetModel.from_pretrained("fusing/stable-diffusion-v1-5-controlnet-openpose", torch_dtype=torch.float16)
+	elif controlnet == 'openpose21':
+		detector_kwargs = dict()
+		detector_model = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+		controlnet_model = ControlNetModel.from_pretrained("thibaud/controlnet-sd21-openpose-diffusers", torch_dtype=torch.float16)
+		sdmodel = 'stabilityai/stable-diffusion-2-1'
 	elif controlnet == 'depth':
 		detector_kwargs = dict()
 		detector_model = MidasDetectorWrapper()
@@ -554,6 +559,14 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 		})
 		detector_model = MLSDdetector.from_pretrained("lllyasviel/ControlNet")
 		controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-mlsd", torch_dtype=torch.float16)
+	elif controlnet == 'lineart21':
+		detector_kwargs = dict({
+			'thr_v': 0.1 if mlsd_score_thr==None else mlsd_score_thr,
+			'thr_d': 0.1 if mlsd_dist_thr==None else mlsd_dist_thr
+		})
+		detector_model = MLSDdetector.from_pretrained("lllyasviel/ControlNet")
+		controlnet_model = ControlNetModel.from_pretrained("thibaud/controlnet-sd21-lineart-diffusers", torch_dtype=torch.float16)
+		sdmodel = 'stabilityai/stable-diffusion-2-1'
 	elif controlnet == 'hed':
 		detector_kwargs = dict()
 		detector_model = HEDdetector.from_pretrained("lllyasviel/ControlNet")
