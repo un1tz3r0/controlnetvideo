@@ -14,50 +14,18 @@ from diffusers import ControlNetModel, UniPCMultistepScheduler, EulerAncestralDi
 from stable_diffusion_controlnet_img2img import StableDiffusionControlNetImg2ImgPipeline
 from typing import Tuple, List, FrozenSet, Sequence, MutableSequence, Mapping, Optional, Any, Type, Union
 from controlnet_aux import CannyDetector, OpenposeDetector, MLSDdetector, HEDdetector, MidasDetector
-
-"""
-def smooth_flow_spatiotemporal(flow, sigma:float):
-	''' smooth dense optical flow using a 3D edge-preserving filter. note implementing this
-	with opencv is quite possible but would require delaying the frame output due to the
-	nonlocal-means denoising algorithm's working on the middle frame of a temporal window
-	consisting of an odd number of frames so as to be symmetrical in lookahead and previously
-	seen frames. '''
-
-	# ...
-	cv2.fastNlMeansDenoisingMulti(flow, flow, sigma, 0, 0)
-	# ...
-"""
+import pathlib
 
 # ----------------------------------------------------------------------
-# motion compensation for img2img feedback using dense optical flow
-#
-# so this is a crude and ultimately not very useful technique that
-# i tried to use prior output as an init image to reduce sensitivity
-# to the noise which had no correlation between frames, and produce
-# output frames which stayed visually consistent over time. as it turns
-# out though, this doesn't actually work that well, so my plan is to
-# abandon this approach and try generating less disjoint noisy latents
-# latent space interpolations even at full denoising work well and are
-# generally fairly smooth and linear. This should net me better results,
-# even though it will mean duplicating the functionality of the
-# prepare_latents() pipeline method, in order to add seed interpolation
-# in the form of a persistent noise buffer which is blended gradually
-# with random values, producing a slowly changing exponential moving
-# average that changes only slightly from frame to frame.
-#
-# Combining this technique with possibly panning using the mean
-# first xy moment of the motion estimate, in order to track the
-# global movement of video taken from a hand-held camera, is another
-# possible improvement i'd like to explore next.
-#
-# finally, someone else on huggingface has shared a "temporal"
-# ControlNet model that they trained on prior frames, which appears to
-# improve cross-frame consistency significantly. I plan to try and
-# extend the controlnetimg2img pipeline
-#
-# https://huggingface.co/CiaraRowles/TemporalNet
-
+# Motion estimation using the Raft optical flow model (and some legacy
+# farneback code that is not currently used)
 # ----------------------------------------------------------------------
+
+
+# this is a different, and ultimately less effective, approach than
+# the one used by Ciara Rowles in her TemporalNet model, which looks
+# very promising, along with her other work on video prediction.
+# See: https://huggingface.co/CiaraRowles/TemporalNet
 
 from torchvision.models.optical_flow import raft_large
 from torchvision.models.optical_flow import Raft_Large_Weights
@@ -72,8 +40,7 @@ raft_model = raft_model.eval()
 
 
 def estimate_motion_raft(srcframe1, srcframe2, prev_flow:Optional[np.ndarray] = None, alpha=1.0, sigma=50.0):
-	#raise NotImplementedError("raft optical flow is not yet implemented")
-	
+
 	img1_batch = torch.tensor(np.asarray(srcframe1).transpose((2, 1,
 0))).unsqueeze(0)
 	img2_batch = torch.tensor(np.asarray(srcframe2).transpose((2, 1,
@@ -88,6 +55,45 @@ def estimate_motion_raft(srcframe1, srcframe2, prev_flow:Optional[np.ndarray] = 
 	flow = list_of_flows[0].cpu().detach().numpy()
 	return flow
 
+
+def transfer_motion(flow, destframe, reverse_order=True):
+	'''
+	transfer motion from dense optical flow onto destframe^t-1 to get destframe^t
+
+	reverse order is used when the y axis is the first plane of the flow, and the x is the second,
+	as in the results from raft
+	'''
+	if len(flow.shape) == 4:
+		flow = np.transpose(flow[0], (2, 1, 0))
+	
+	# Compute the inverse flow from frame2 to frame1
+	inv_flow = -flow
+	destframe = np.asarray(destframe)
+	# Warp frame3 using the inverse flow
+	h, w = destframe.shape[:2]
+	x, y = np.meshgrid(np.arange(w), np.arange(h))
+	x_inv = np.round(x + inv_flow[...,0 if not reverse_order else 1]).astype(np.float32)
+	y_inv = np.round(y + inv_flow[...,1 if not reverse_order else 0]).astype(np.float32)
+	x_inv = np.clip(x_inv, 0, w-1)
+	y_inv = np.clip(y_inv, 0, h-1)
+	warped = cv2.remap(np.asarray(destframe), x_inv, y_inv, cv2.INTER_LINEAR)
+
+	return PIL.Image.fromarray(warped)
+
+
+def flow_to_image_raft(flow):
+	if len(flow.shape) == 4:
+		flow = np.transpose(flow[0], (2, 1, 0))
+	return flow_to_image_farneback(flow)
+
+
+# not currently used...
+
+def extract_first_moment_from_flow(flow):
+	''' extract first moment from dense optical flow '''
+	moment = np.mean(flow, axis=(0,1))
+	flow = np.array(flow[:,:,:] - moment[None, None, :])
+	return flow, moment
 
 def estimate_motion_farneback(srcframe1, srcframe2, prev_flow:Optional[np.ndarray] = None, alpha=1.0, sigma=50.0):
 	''' given the current frame and the prior frame, estimate dense optical flow
@@ -124,38 +130,6 @@ def estimate_motion_farneback(srcframe1, srcframe2, prev_flow:Optional[np.ndarra
 	while the raw flow should be used for motion estimation on the next frame. '''
 	return flow, smoothed_flow
 
-def transfer_motion(flow, destframe, reverse_order=True):
-	'''
-	transfer motion from dense optical flow onto destframe^t-1 to get destframe^t
-
-	reverse order is used when the y axis is the first plane of the flow, and the x is the second,
-	as in the results from raft
-	'''
-	if len(flow.shape) == 4:
-		flow = np.transpose(flow[0], (2, 1, 0))
-	
-	# Compute the inverse flow from frame2 to frame1
-	inv_flow = -flow
-	destframe = np.asarray(destframe)
-	# Warp frame3 using the inverse flow
-	h, w = destframe.shape[:2]
-	x, y = np.meshgrid(np.arange(w), np.arange(h))
-	x_inv = np.round(x + inv_flow[...,0 if not reverse_order else 1]).astype(np.float32)
-	y_inv = np.round(y + inv_flow[...,1 if not reverse_order else 0]).astype(np.float32)
-	x_inv = np.clip(x_inv, 0, w-1)
-	y_inv = np.clip(y_inv, 0, h-1)
-	warped = cv2.remap(np.asarray(destframe), x_inv, y_inv, cv2.INTER_LINEAR)
-
-	return PIL.Image.fromarray(warped)
-
-
-def extract_first_moment_from_flow(flow):
-	''' extract first moment from dense optical flow '''
-	moment = np.mean(flow, axis=(0,1))
-	flow = np.array(flow[:,:,:] - moment[None, None, :])
-	return flow, moment
-
-
 def flow_to_image_farneback(flow):
 	''' convert dense optical flow to image, direction -> hue, magnitude -> brightness '''
 	hsv = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
@@ -166,12 +140,21 @@ def flow_to_image_farneback(flow):
 	rgb = cv2.cvtColor(hsv,cv2.COLOR_HSV2BGR)
 	return PIL.Image.fromarray(rgb)
 
-def flow_to_image_raft(flow):
-	#import optical_flow_raft
-	#return optical_flow_raft.flow_to_image(flow)
-	if len(flow.shape) == 4:
-		flow = np.transpose(flow[0], (2, 1, 0))
-	return flow_to_image_farneback(flow)
+
+## never got this working yet, could significantly improve results
+#
+# def smooth_flow_spatiotemporal(flow, sigma:float):
+# 	''' smooth dense optical flow using a 3D edge-preserving filter. note implementing this
+# 	with opencv is quite possible but would require delaying the frame output due to the
+# 	nonlocal-means denoising algorithm's working on the middle frame of a temporal window
+# 	consisting of an odd number of frames so as to be symmetrical in lookahead and previously
+# 	seen frames. '''
+#
+# 	cv2.fastNlMeansDenoisingMulti(flow, flow, sigma, 0, 0)
+
+# -----------------------------------------------------------------------------------------------
+# helpers for depth-based controlnets
+# -----------------------------------------------------------------------------------------------
 
 class MidasDetectorWrapper:
 	''' a wrapper around the midas detector model which allows
@@ -208,6 +191,10 @@ def depth_to_normal(image):
 		image = (image * 127.5 + 127.5).clip(0, 255).astype(np.uint8)
 		image = Image.fromarray(image)
 		return image
+
+# -----------------------------------
+# general image helpers
+# -----------------------------------
 
 def padto(image, width, height, gravityx=0.5, gravityy=0.5):
 	import PIL.ImageOps, PIL.Image
@@ -322,6 +309,8 @@ def rgbtohsl(rgb:np.ndarray):
 	return hsl #np.ndarray([h, s, l])
 
 def hsltorgb(hsl:np.ndarray):
+	''' vectorized hsl to rgb conversion 
+	input is a numpy array of shape (..., 3) and dtype float, with hue first in 0-360, then sat and lum in 0-1 '''
 	h, s, l = hsl[:,:,0], hsl[:,:,1], hsl[:,:,2]
 	c = (1 - np.abs(2*l-1)) * s
 	h = h / 60
@@ -390,7 +379,7 @@ def histomatch(source, template):
 from skimage.exposure import match_histograms
 import cv2
 
-def maintain_colors(color_match_sample, prev_img, mode):
+def maintain_colors(color_match_sample, prev_img, mode, amount=1.0):
 		''' adjust output frame to match histogram of first output frame,
 		this is how deforum does it, big thanks to them '''
 		if mode == 'rgb':
@@ -488,6 +477,9 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.option('--max-dimension', type=int, default=832, help="maximum dimension of the video")
 @click.option('--min-dimension', type=int, default=512, help="minimum dimension of the video")
 @click.option('--round-dims-to', type=int, default=128, help="round the dimensions to the nearest multiple of this number")
+@click.option('--no-audio', is_flag=True, default=False, help="don't include audio in the output video, even if the input video has audio")
+@click.option('--audio-from', type=click.Path(exists=True), default=None, help="audio file to use for the output video, replaces the audio from the input video, will be truncated to duration of input or --duration if given")
+@click.option('--audio-offset', type=float, default=None, help="offset in seconds to start the audio from, when used with --audio-from")
 @click.option('--prompt', type=str, default=None, help="prompt used to guide the denoising process")
 @click.option('--negative-prompt', type=str, default=None, help="negative prompt, can be used to prevent the model from generating certain words")
 @click.option('--prompt-strength', type=float, default=7.5, help="how much influence the prompt has on the output")
@@ -502,15 +494,17 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.option('--show-input/--no-show-input', is_flag=True, default=False, help="show the input frame")
 @click.option('--show-output/--no-show-output', is_flag=True, default=True, help="show the output frame")
 @click.option('--show-motion/--no-show-motion', is_flag=True, default=False, help="show the motion transfer (not implemented yet)")
-@click.option('--dump-frames', type=click.Path(), default=None, help="write intermediate dump images to a file/files during processing to visualise progress. may contain {} placeholder for frame number")
+@click.option('--dump-frames', type=click.Path(), default=None, help="write intermediate frame images to a file/files during processing to visualise progress. may contain various {} placeholders")
+@click.option('--skip-dumped-frames', is_flag=True, default=False, help="read dumped frames from a previous run instead of processing the input video")
 @click.option('--dump-video', is_flag=True, default=False, help="write intermediate dump images to the final video instead of just the final output image")
 @click.option('--color-fix', type=click.Choice(['none', 'rgb', 'hsv', 'lab']), default='lab', help="prevent color from drifting due to feedback and model bias by fixing the histogram to the first frame. specify colorspace for histogram matching, e.g. 'rgb' or 'hsv' or 'lab', or 'none' to disable.")
+@click.option('--color-amount', type=float, default=0.0, help="blend between the original color and the color matched version, 0.0-1.0")
 @click.option('--color-info', is_flag=True, default=False, help="print extra stats about the color content of the output to help debug color drift issues")
 @click.option('--canny-low-thr', type=float, default=100, help="canny edge detector lower threshold")
 @click.option('--canny-high-thr', type=float, default=200, help="canny edge detector higher threshold")
 @click.option('--mlsd-score-thr', type=float, default=0.1, help="mlsd line detector v threshold")
 @click.option('--mlsd-dist-thr', type=float, default=0.1, help="mlsd line detector d threshold")
-def main(input_video, output_video, start_time, end_time, duration, max_dimension, min_dimension, round_dims_to, prompt, negative_prompt, prompt_strength, num_inference_steps, controlnet, controlnet_strength, fix_orientation, init_image_strength, feedthrough_strength, show_detector, show_input, show_output, show_motion, dump_frames, dump_video, color_fix, color_info,
+def main(input_video, output_video, start_time, end_time, duration, max_dimension, min_dimension, round_dims_to, no_audio, audio_from, audio_offset, prompt, negative_prompt, prompt_strength, num_inference_steps, controlnet, controlnet_strength, fix_orientation, init_image_strength, feedthrough_strength, show_detector, show_input, show_output, show_motion, dump_frames, skip_dumped_frames, dump_video, color_fix, color_amount, color_info,
 		canny_low_thr=None, canny_high_thr=None, mlsd_score_thr=None, mlsd_dist_thr=None):
 	# run controlnet pipeline on video
 
@@ -642,17 +636,33 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 		# Converts each frame to grayscale as required by optical flow
 		input_gray = cv2.cvtColor(input_frame, cv2.COLOR_RGB2GRAY)
 
+		output_frame = None
+		skipped = False
+		skipped_frame = None
+		if dump_frames != None and skip_dumped_frames:
+			inputpath=pathlib.Path(input_video).resolve()
+			dump_frames_filename = dump_frames.format(inpath=str(inputpath), indir=str(inputpath.parent), instem=str(inputpath.stem), n=framenum)
+			try:
+				if pathlib.Path(dump_frames_filename).exists():
+					print(f"Skipping frame {framenum} because {dump_frames_filename} already exists, reading output image from file...")
+					skipped_frame = PIL.Image.open(dump_frames_filename)
+					output_frame = skipped_frame.crop((skipped_frame.width - width, 0, skipped_frame.width, height))
+					skipped = True
+			except Exception as e:
+				print(f"Error reading {dump_frames_filename}, continuing...  {e}")
+
 		# if we have a previous frame, transfer motion from the input to the output and blend with the noise
-		if prev_input_frame != None:
+		if prev_input_frame != None and not skipped:
 			#flow, smoothed_flow = estimate_motion_raft(prev_input_frame, input_frame, flow, motion_smoothing)
 			flow = estimate_motion_raft(prev_input_frame, input_image, flow, motion_smoothing)
 			predicted_output_frame = transfer_motion(flow, prev_output_frame)
 		else:
 			predicted_output_frame = None
 
-		control_image = detector_model(input_image, **detector_kwargs).convert("RGB")
-		ci = np.asarray(control_image)
-		print(f"ci.shape={ci.shape} ci.min={ci.min()} ci.max={ci.max()} ci.mean={ci.mean()} ci.std={ci.std()}")
+		if not skipped:
+			control_image = detector_model(input_image, **detector_kwargs).convert("RGB")
+			ci = np.asarray(control_image)
+			#print(f"ci.shape={ci.shape} ci.min={ci.min()} ci.max={ci.max()} ci.mean={ci.mean()} ci.std={ci.std()}")
 
 		if predicted_output_frame == None:
 			strength = feedthrough_strength * init_image_strength
@@ -660,25 +670,33 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 		else:
 			strength = init_image_strength
 			init_image = PIL.Image.blend(input_image, predicted_output_frame, 1.0 - feedthrough_strength)
+			
+		if output_frame == None:
+			# run the pipeline
+			output_frame = pipe(
+				prompt=prompt,
+				guidance_scale=prompt_strength,
+				negative_prompt=negative_prompt,
+				num_inference_steps=num_inference_steps,
+				generator=generator,
+				controlnet_conditioning_image=[control_image],
+				controlnet_conditioning_scale=controlnet_strength,
+				image = init_image,
+				strength = 1.0 - strength,
+			).images[0]
 
-		# run the pipeline
-		output_frame = pipe(
-			prompt=prompt,
-			guidance_scale=prompt_strength,
-			negative_prompt=negative_prompt,
-			num_inference_steps=num_inference_steps,
-			generator=generator,
-			controlnet_conditioning_image=[control_image],
-			controlnet_conditioning_scale=controlnet_strength,
-			image = init_image,
-			strength = 1.0 - strength,
-		).images[0]
-
-		if color_fix != 'none':
+		if color_fix != 'none' and color_amount > 0.0:
 			if first_output_frame == None:
+				# save the first output frame for color correction
 				first_output_frame = output_frame.copy()
 			else:
-				output_frame = PIL.Image.fromarray(maintain_colors(np.asarray(first_output_frame), np.asarray(output_frame), color_fix))
+				# skipped frames don't get color correction, since they already have it applied
+				if not skipped:
+					# blend the color fix into the output frame
+					output_frame = PIL.Image.fromarray((
+						np.asarray(output_frame)*(1.0-color_amount) +
+						maintain_colors(np.asarray(first_output_frame), np.asarray(output_frame), color_fix)*color_amount
+					).astype(np.uint8))
 
 		if show_motion:
 			if not (flow is None):
@@ -686,14 +704,16 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 			else:
 				motion_image = PIL.Image.new("RGB", (width, height), (0,0,0))
 
-		if dump_frames != None or dump_video:
-			final_frame = stackh( list(
+		final_frame = output_frame
+		if (dump_frames != None or dump_video):
+			if skipped and dump_video:
+				final_frame = skipped_frame
+			elif not skipped:
+				final_frame = stackh( list(
 					list([input_image] if show_input else []) +
 					list([motion_image] if show_motion else []) +
 					list([control_image] if show_detector else []) +
 					list([output_frame] if show_output else [])) )
-		else:
-			final_frame = output_frame
 		
 		if color_info:
 			meanhslout = np.mean(rgbtohsl(np.asarray(output_frame)), axis = (0,1))
@@ -703,8 +723,13 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 				diffhslout = meanhslout - prevmeanhslout
 				print(f"output color diff: mean hue{diffhslout[0]}, mean sat={diffhslout[1]}, mean lum={diffhslout[2]}")
 
-		if dump_frames != None:
-			final_frame.save(dump_frames.format(framenum))
+		if dump_frames != None and not skipped:
+			# inputpath=pathlib.Path(input_video).resolve()
+			# dump_frames_filename = dump_frames.format(inpath=str(inputpath), indir=str(inputpath.parent), instem=str(inputpath.stem), n=framenum)
+			print(f"Dumping frame {framenum} as png to {dump_frames_filename}...")
+			if pathlib.Path(dump_frames_filename).parent.is_dir() == False:
+				pathlib.Path(dump_frames_filename).parent.mkdir(parents=True, exist_ok=True)
+			final_frame.save(dump_frames_filename)
 
 		#output_frame.save("frame.png")
 		prev_input_frame = input_image.copy()
