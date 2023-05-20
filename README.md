@@ -89,7 +89,7 @@ And a progress frame:
 
 And the output video:
 
-<video src="./examples/PXL_20230422_013745844.TSb_out.mp4"/>
+<video src="./examples/PXL_20230422_013745844.TSb_out.mp4"></video>
 
 
 # Usage
