@@ -1,10 +1,10 @@
-A CLI tool for applying Stable Diffusion Img2Img with ControlNets to videos, with stabilization provided by feeding back the prior output frame as a partial init image. The input frames are fed in as the ControlNet control image through the appropriate detector.
+A CLI tool for applying __Stable Diffusion__ &times; __ControlNets__ to videos, with stabilization provided by feeding back the prior output frame as a partial init image. The input frames are fed in as the ControlNet control image through the appropriate detector.
 
 # Installation
 
 ## Pre-requisites
 
-You may wish to set up a venv and activate it before installing the dependencies. 
+You may wish to set up a __venv__ and activate it before installing the dependencies. 
 
 ```
 python3 -m venv venv
