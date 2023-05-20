@@ -3,7 +3,6 @@
 !pip install -q git+https://github.com/mikegarts/diffusers.git@stablediffusion.controlnet.img2img.pipeline
 """
 
-import wrapt
 import click
 import numpy as np
 import torch
@@ -16,77 +15,111 @@ from typing import Tuple, List, FrozenSet, Sequence, MutableSequence, Mapping, O
 from controlnet_aux import CannyDetector, OpenposeDetector, MLSDdetector, HEDdetector, MidasDetector
 import pathlib
 
+
 # ----------------------------------------------------------------------
-# Motion estimation using the Raft optical flow model (and some legacy
+# Motion estimation using the RAFT optical flow model (and some legacy
 # farneback code that is not currently used)
 # ----------------------------------------------------------------------
-
-
-# this is a different, and ultimately less effective, approach than
-# the one used by Ciara Rowles in her TemporalNet model, which looks
-# very promising, along with her other work on video prediction.
-# See: https://huggingface.co/CiaraRowles/TemporalNet
 
 from torchvision.models.optical_flow import raft_large
 from torchvision.models.optical_flow import Raft_Large_Weights
 import torchvision.transforms.functional
 import torch
 
-raft_weights = Raft_Large_Weights.DEFAULT
-raft_transforms = raft_weights.transforms()
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-raft_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
-raft_model = raft_model.eval()
+class RAFTMotionEstimator:
+	def __init__(self):
+		self.raft_weights = Raft_Large_Weights.DEFAULT
+		self.raft_transforms = self.raft_weights.transforms()
+		self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+		self.raft_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(self.device)
+		self.raft_model = self.raft_model.eval()
 
+	def estimate_motion(self, srcframe1, srcframe2, prev_flow:Optional[np.ndarray] = None, alpha=0.0, sigma=0.0):
+		'''
+		estimate dense optical flow from srcframe1 to srcframe2, using the Raft model
+		
+		exponential temporal smoothing is applied using the previous flow, according to 
+		alpha, which should be between 0.0 and 1.0.  If alpha is 0.0, no temporal smoothing
+		is applied. the flow will be smoothed spatially using a gaussian filter with sigma
+		if sigma > 0.0.  If sigma is 0.0, no spatial smoothing is applied.
+		'''
+		
+		# put the two frames into tensors
+		img1_batch = torch.tensor(np.asarray(srcframe1).transpose((2, 1, 0))).unsqueeze(0)
+		img2_batch = torch.tensor(np.asarray(srcframe2).transpose((2, 1, 0))).unsqueeze(0)
 
-def estimate_motion_raft(srcframe1, srcframe2, prev_flow:Optional[np.ndarray] = None, alpha=1.0, sigma=50.0):
+		# resize the frames to multiples of 8 for the RAFT model (which requires this)
+		img1_batch = torchvision.transforms.functional.resize(img1_batch, size=[(srcframe1.width//8)*8, (srcframe1.height//8)*8], antialias=False)
+		img2_batch = torchvision.transforms.functional.resize(img2_batch, size=[(srcframe2.width//8)*8, (srcframe2.height//8)*8], antialias=False)
+		
+		# apply the transforms required by the RAFT model
+		img1_batch, img2_batch = self.raft_transforms(img1_batch, img2_batch, )
 
-	img1_batch = torch.tensor(np.asarray(srcframe1).transpose((2, 1,
-0))).unsqueeze(0)
-	img2_batch = torch.tensor(np.asarray(srcframe2).transpose((2, 1,
-0))).unsqueeze(0)
+		# Compute the dense optical flow from frame1 to frame2
+		list_of_flows = self.raft_model(img1_batch.to(self.device), img2_batch.to(self.device))
+		flow = list_of_flows[0].cpu().detach().numpy()
+		
+		if len(flow.shape) == 4:
+			if flow.shape[0] == 1:
+				flow = flow[0]
+		if flow.shape[0] == 2:
+			flow = np.transpose(flow, (2, 1, 0))
 
-	img1_batch = torchvision.transforms.functional.resize(img1_batch, size=[(srcframe1.width//8)*8, (srcframe1.height//8)*8], antialias=False)
-	img2_batch = torchvision.transforms.functional.resize(img2_batch, size=[(srcframe2.width//8)*8, (srcframe2.height//8)*8], antialias=False)
-	img1_batch, img2_batch = raft_transforms(img1_batch, img2_batch)
+		# smooth the flow spatially using a gaussian filter if sigma > 0.0
+		#if sigma > 0.0:
+		#	flow = cv2.bilateralFilter(flow, 9, sigma, sigma)
+		if sigma > 0.0:
+			flow = cv2.GaussianBlur(flow, (0,0), sigma)
+		# else:
+			#flow = flow[0]
+			#flow[...,0] = cv2.GaussianBlur(flow[...,0], (0, 0), sigma)
+			#flow[...,1] = cv2.GaussianBlur(flow[...,1], (0, 0), sigma)
 
-	# Compute the dense optical flow from frame1 to frame2
-	list_of_flows = raft_model(img1_batch.to(device), img2_batch.to(device))
-	flow = list_of_flows[0].cpu().detach().numpy()
-	return flow
+		# smooth the flow using exponential temporal smoothing if alpha is < 1.0
+		if not (prev_flow is None) and alpha > 0.0:
+			flow = prev_flow * alpha + flow * (1.0 - alpha)
+		
+		# return the smoothed flow
+		return flow
 
+	def transfer_motion(self, flow, destframe, reverse_order=True):
+		'''
+		transfer motion from dense optical flow onto destframe^t-1 to get destframe^t
 
-def transfer_motion(flow, destframe, reverse_order=True):
-	'''
-	transfer motion from dense optical flow onto destframe^t-1 to get destframe^t
+		reverse order is used when the y axis is the first plane of the flow, and the x is the second,
+		as in the results from raft
+		'''
+		if len(flow.shape) == 4:
+			flow = np.transpose(flow[0], (2, 1, 0))
+		
+		# Compute the inverse flow from frame2 to frame1
+		inv_flow = -flow
+		destframe = np.asarray(destframe)
+		
+		# Warp frame3 using the inverse flow
+		h, w = destframe.shape[:2]
+		x, y = np.meshgrid(np.arange(w), np.arange(h))
+		x_inv = np.round(x + inv_flow[...,0 if not reverse_order else 1]).astype(np.float32)
+		y_inv = np.round(y + inv_flow[...,1 if not reverse_order else 0]).astype(np.float32)
+		x_inv = np.clip(x_inv, 0, w-1)
+		y_inv = np.clip(y_inv, 0, h-1)
+		warped = cv2.remap(np.asarray(destframe), x_inv, y_inv, cv2.INTER_LINEAR)
 
-	reverse order is used when the y axis is the first plane of the flow, and the x is the second,
-	as in the results from raft
-	'''
-	if len(flow.shape) == 4:
-		flow = np.transpose(flow[0], (2, 1, 0))
-	
-	# Compute the inverse flow from frame2 to frame1
-	inv_flow = -flow
-	destframe = np.asarray(destframe)
-	# Warp frame3 using the inverse flow
-	h, w = destframe.shape[:2]
-	x, y = np.meshgrid(np.arange(w), np.arange(h))
-	x_inv = np.round(x + inv_flow[...,0 if not reverse_order else 1]).astype(np.float32)
-	y_inv = np.round(y + inv_flow[...,1 if not reverse_order else 0]).astype(np.float32)
-	x_inv = np.clip(x_inv, 0, w-1)
-	y_inv = np.clip(y_inv, 0, h-1)
-	warped = cv2.remap(np.asarray(destframe), x_inv, y_inv, cv2.INTER_LINEAR)
+		return PIL.Image.fromarray(warped)
 
-	return PIL.Image.fromarray(warped)
+	def flow_to_image(self, flow):
+		if len(flow.shape) == 4:
+			flow = np.transpose(flow[0], (2, 1, 0))
+		''' convert dense optical flow to image, direction -> hue, magnitude -> brightness '''
+		hsv = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
+		hsv[...,1] = 255
+		mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+		hsv[...,0] = ang*180/np.pi/2
+		hsv[...,2] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX)
+		rgb = cv2.cvtColor(hsv,cv2.COLOR_HSV2BGR)
+		return PIL.Image.fromarray(rgb)
 
-
-def flow_to_image_raft(flow):
-	if len(flow.shape) == 4:
-		flow = np.transpose(flow[0], (2, 1, 0))
-	return flow_to_image_farneback(flow)
-
-
+"""
 # not currently used...
 
 def extract_first_moment_from_flow(flow):
@@ -139,7 +172,7 @@ def flow_to_image_farneback(flow):
 	hsv[...,2] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX)
 	rgb = cv2.cvtColor(hsv,cv2.COLOR_HSV2BGR)
 	return PIL.Image.fromarray(rgb)
-
+"""
 
 ## never got this working yet, could significantly improve results
 #
@@ -335,6 +368,31 @@ def hsltorgb(hsl:np.ndarray):
 	b *= 255
 	return np.ndarray([r, g, b])
 
+def hsltorgb(hsl:np.ndarray):
+  h, s, l = hsl[:,:,0], hsl[:,:,1], hsl[:,:,2]
+  c = (1 - np.abs(2*l-1)) * s
+  h = h / 60
+  x = c * (1 - np.abs(h % 2 - 1))
+  m = l - c/2
+  r = np.zeros(h.shape)
+  g = np.zeros(h.shape)
+  b = np.zeros(h.shape)
+  r[h < 1] = c[h < 1]
+  r[h >= 1] = x[h >= 1]
+  g[h < 1] = x[h < 1]
+  g[h >= 2] = c[h >= 2]
+  b[h < 2] = c[h < 2]
+  b[h >= 3] = x[h >= 3]
+  r[h >= 4] = c[h >= 4]
+  g[h >= 4] = x[h >= 4]
+  r += m
+  g += m
+  b += m
+  r *= 255
+  g *= 255
+  b *= 255
+  return np.ndarray([r, g, b])
+
 def brightcontrastmatch(source, template):
 	oldshape = source.shape
 	source = source.ravel()
@@ -477,9 +535,11 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.option('--max-dimension', type=int, default=832, help="maximum dimension of the video")
 @click.option('--min-dimension', type=int, default=512, help="minimum dimension of the video")
 @click.option('--round-dims-to', type=int, default=128, help="round the dimensions to the nearest multiple of this number")
+# not implemented... yet:
 @click.option('--no-audio', is_flag=True, default=False, help="don't include audio in the output video, even if the input video has audio")
 @click.option('--audio-from', type=click.Path(exists=True), default=None, help="audio file to use for the output video, replaces the audio from the input video, will be truncated to duration of input or --duration if given")
 @click.option('--audio-offset', type=float, default=None, help="offset in seconds to start the audio from, when used with --audio-from")
+# stable diffusion options
 @click.option('--prompt', type=str, default=None, help="prompt used to guide the denoising process")
 @click.option('--negative-prompt', type=str, default=None, help="negative prompt, can be used to prevent the model from generating certain words")
 @click.option('--prompt-strength', type=float, default=7.5, help="how much influence the prompt has on the output")
@@ -490,6 +550,8 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.option('--fix-orientation/--no-fix-orientation', is_flag=True, default=True, help="resize videos shot in portrait mode on some devices to fix incorrect aspect ratio bug")
 @click.option('--init-image-strength', type=float, default=0.5, help="the init-image strength, or how much of the prompt-guided denoising process to skip in favor of starting with an existing image")
 @click.option('--feedthrough-strength', type=float, default=0.0, help="the ratio of input to motion compensated prior output to feed through to the next frame")
+@click.option('--motion-alpha', type=float, default=0.1, help="smooth the motion vectors over time, 0.0 is no smoothing, 1.0 is maximum smoothing")
+@click.option('--motion-sigma', type=float, default=0.3, help="smooth the motion estimate spatially, 0.0 is no smoothing, used as sigma for gaussian blur")
 @click.option('--show-detector/--no-show-detector', is_flag=True, default=False, help="show the controlnet detector output")
 @click.option('--show-input/--no-show-input', is_flag=True, default=False, help="show the input frame")
 @click.option('--show-output/--no-show-output', is_flag=True, default=True, help="show the output frame")
@@ -504,8 +566,27 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.option('--canny-high-thr', type=float, default=200, help="canny edge detector higher threshold")
 @click.option('--mlsd-score-thr', type=float, default=0.1, help="mlsd line detector v threshold")
 @click.option('--mlsd-dist-thr', type=float, default=0.1, help="mlsd line detector d threshold")
-def main(input_video, output_video, start_time, end_time, duration, max_dimension, min_dimension, round_dims_to, no_audio, audio_from, audio_offset, prompt, negative_prompt, prompt_strength, num_inference_steps, controlnet, controlnet_strength, fix_orientation, init_image_strength, feedthrough_strength, show_detector, show_input, show_output, show_motion, dump_frames, skip_dumped_frames, dump_video, color_fix, color_amount, color_info,
-		canny_low_thr=None, canny_high_thr=None, mlsd_score_thr=None, mlsd_dist_thr=None):
+def main(input_video, output_video, start_time, end_time, 
+	 	duration, max_dimension, min_dimension, round_dims_to, 
+		no_audio, audio_from, audio_offset, prompt, negative_prompt, 
+		prompt_strength, num_inference_steps, controlnet, 
+		controlnet_strength, fix_orientation, init_image_strength, 
+		feedthrough_strength, motion_alpha, motion_sigma, 
+		show_detector, show_input, show_output, show_motion, 
+		dump_frames, skip_dumped_frames, dump_video, 
+		color_fix, color_amount, color_info, canny_low_thr=None, 
+		canny_high_thr=None, mlsd_score_thr=None, mlsd_dist_thr=None
+	):
+	
+	# substitute {} placeholders in output_video with input_video basename
+	if output_video != None and input_video != None:
+			inputpath=pathlib.Path(input_video).resolve()
+			output_video = output_video.format(inpath=str(inputpath), indir=str(inputpath.parent), instem=str(inputpath.stem))
+			output_video_path = pathlib.Path(output_video)
+			if not output_video_path.parent.exists():
+				output_video_path.parent.mkdir(parents=True)
+			output_video = str(output_video_path)
+	
 	# run controlnet pipeline on video
 
 	# choose controlnet model and detector based on the --controlnet option
@@ -585,7 +666,10 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 	else:
 		raise NotImplementedError("controlnet type not implemented")
 
-	# instantiate the pipeline
+	# intantiate the motion estimation model
+	motion = RAFTMotionEstimator()
+
+	# instantiate the diffusion pipeline
 	if controlnet_model != None:
 		pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(sdmodel, controlnet=controlnet_model, torch_dtype=torch.float16)
 	else:
@@ -597,6 +681,7 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 	elif scheduler == 'eulera':
 		pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
 
+
 	pipe.enable_xformers_memory_efficient_attention()
 	pipe.enable_model_cpu_offload()
 	pipe.run_safety_checker = lambda image, text_embeds, text_embeds_negative: (image, False)
@@ -607,9 +692,8 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 	prev_input_gray = None
 	prev_predicted_output_frame = None
 	flow = None
-	smoothed_flow = None
 
-	def frame_filter(framenum, input_frame, motion_smoothing=0.6):
+	def frame_filter(framenum, input_frame):
 		# state kept between frames
 		nonlocal prev_input_frame
 		nonlocal prev_input_gray
@@ -639,23 +723,25 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 		output_frame = None
 		skipped = False
 		skipped_frame = None
-		if dump_frames != None and skip_dumped_frames:
+		if dump_frames != None:
 			inputpath=pathlib.Path(input_video).resolve()
 			dump_frames_filename = dump_frames.format(inpath=str(inputpath), indir=str(inputpath.parent), instem=str(inputpath.stem), n=framenum)
 			try:
-				if pathlib.Path(dump_frames_filename).exists():
+				if pathlib.Path(dump_frames_filename).exists() and skip_dumped_frames:
 					print(f"Skipping frame {framenum} because {dump_frames_filename} already exists, reading output image from file...")
 					skipped_frame = PIL.Image.open(dump_frames_filename)
 					output_frame = skipped_frame.crop((skipped_frame.width - width, 0, skipped_frame.width, height))
 					skipped = True
 			except Exception as e:
 				print(f"Error reading {dump_frames_filename}, continuing...  {e}")
-
+		else:
+			dump_frames_filename = None
+		
 		# if we have a previous frame, transfer motion from the input to the output and blend with the noise
 		if prev_input_frame != None and not skipped:
 			#flow, smoothed_flow = estimate_motion_raft(prev_input_frame, input_frame, flow, motion_smoothing)
-			flow = estimate_motion_raft(prev_input_frame, input_image, flow, motion_smoothing)
-			predicted_output_frame = transfer_motion(flow, prev_output_frame)
+			flow = motion.estimate_motion(prev_input_frame, input_image, flow, motion_alpha, motion_sigma)
+			predicted_output_frame = motion.transfer_motion(flow, prev_output_frame)
 		else:
 			predicted_output_frame = None
 
@@ -700,7 +786,7 @@ def main(input_video, output_video, start_time, end_time, duration, max_dimensio
 
 		if show_motion:
 			if not (flow is None):
-				motion_image = flow_to_image_raft(flow)
+				motion_image = motion.flow_to_image(flow)
 			else:
 				motion_image = PIL.Image.new("RGB", (width, height), (0,0,0))
 
