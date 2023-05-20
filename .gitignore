@@ -4,7 +4,14 @@ attic/*
 attic
 __pycache__
 __pycache__/*
-*.png
-*.mp4
 *.swp
-
+venv
+venv/*
+videos
+videos/*
+.cache/
+.cache/*
+logs/*
+logs
+shared/*
+shared

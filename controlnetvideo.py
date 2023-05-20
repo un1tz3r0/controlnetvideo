@@ -16,10 +16,10 @@ from controlnet_aux import CannyDetector, OpenposeDetector, MLSDdetector, HEDdet
 import pathlib
 
 
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------
 # Motion estimation using the RAFT optical flow model (and some legacy
 # farneback code that is not currently used)
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------
 
 from torchvision.models.optical_flow import raft_large
 from torchvision.models.optical_flow import Raft_Large_Weights
@@ -27,7 +27,19 @@ import torchvision.transforms.functional
 import torch
 
 class RAFTMotionEstimator:
+	'''
+	Estimate dense optical flow using the RAFT model
+
+	this class is just a wrapper around the RAFT model, which is a pytorch model, and
+	provides a simple interface for estimating dense optical flow from one frame to 
+	another, and for transferring the motion from one video to another, which we use
+	to motion compensate the output feedback into the next frame's img2img model input.
+
+	it's not the greatest way to achieve consistency, for sure, but it works with a 
+	little fiddling.
+	'''
 	def __init__(self):
+		''' inits the RAFT motion estimator, loading the model and weights '''
 		self.raft_weights = Raft_Large_Weights.DEFAULT
 		self.raft_transforms = self.raft_weights.transforms()
 		self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -225,9 +237,9 @@ def depth_to_normal(image):
 		image = Image.fromarray(image)
 		return image
 
-# -----------------------------------
-# general image helpers
-# -----------------------------------
+# -----------------------------------------------------------------------------------------------
+# general image helpers (could be moved to a separate file)
+# -----------------------------------------------------------------------------------------------
 
 def padto(image, width, height, gravityx=0.5, gravityy=0.5):
 	import PIL.ImageOps, PIL.Image
@@ -315,6 +327,10 @@ def textbox(s, font, color, padding=(1,1,1,1), border=(0,0,0,0), corner_radius=(
 	draw = PIL.ImageDraw.Draw(text)
 	draw.text((0, 0), s, font=font, fill=color)
 	return text
+
+# ---------------------------------------------------------------------------------------------
+# Colorspace conversion extravaganza (these belong in a colorspace.py file for sure)
+# ---------------------------------------------------------------------------------------------
 
 def rgbtohsl(rgb:np.ndarray):
 	''' vectorized rgb to hsl conversion 
@@ -526,16 +542,24 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 			#  processed_video.write_videofile(output_video)
 			video.close()
 
+# ----------------------------------------------------------------------------------------------
+# Main entry point, look at all those options!
+# ----------------------------------------------------------------------------------------------
+
 @click.command()
+# input and output video arguments
 @click.argument('input_video', type=click.Path(exists=True))
 @click.argument('output_video', type=click.Path())
+# video timeline options
 @click.option('--start-time', type=float, default=None, help="start time in seconds")
 @click.option('--end-time', type=float, default=None, help="end time in seconds")
 @click.option('--duration', type=float, default=None, help="duration in seconds")
+# video scaling options
 @click.option('--max-dimension', type=int, default=832, help="maximum dimension of the video")
 @click.option('--min-dimension', type=int, default=512, help="minimum dimension of the video")
 @click.option('--round-dims-to', type=int, default=128, help="round the dimensions to the nearest multiple of this number")
-# not implemented... yet:
+@click.option('--fix-orientation/--no-fix-orientation', is_flag=True, default=True, help="resize videos shot in portrait mode on some devices to fix incorrect aspect ratio bug")
+# not implemented... yet (coming soon: beat-reactive video processing):
 @click.option('--no-audio', is_flag=True, default=False, help="don't include audio in the output video, even if the input video has audio")
 @click.option('--audio-from', type=click.Path(exists=True), default=None, help="audio file to use for the output video, replaces the audio from the input video, will be truncated to duration of input or --duration if given")
 @click.option('--audio-offset', type=float, default=None, help="offset in seconds to start the audio from, when used with --audio-from")
@@ -547,11 +571,12 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.option('--num-inference-steps', '--steps', type=int, default=25, help="number of inference steps, depends on the scheduler, trades off speed for quality. 20-50 is a good range from fastest to best.")
 @click.option('--controlnet', type=click.Choice(['aesthetic', 'lineart21', 'hed', 'hed21', 'canny', 'canny21', 'openpose', 'openpose21', 'depth', 'depth21', 'normal', 'mlsd']), default='hed', help="which pretrained controlnet annotator to use")
 @click.option('--controlnet-strength', type=float, default=1.0, help="how much influence the controlnet annotator's output is used to guide the denoising process")
-@click.option('--fix-orientation/--no-fix-orientation', is_flag=True, default=True, help="resize videos shot in portrait mode on some devices to fix incorrect aspect ratio bug")
 @click.option('--init-image-strength', type=float, default=0.5, help="the init-image strength, or how much of the prompt-guided denoising process to skip in favor of starting with an existing image")
 @click.option('--feedthrough-strength', type=float, default=0.0, help="the ratio of input to motion compensated prior output to feed through to the next frame")
+# motion smoothing options
 @click.option('--motion-alpha', type=float, default=0.1, help="smooth the motion vectors over time, 0.0 is no smoothing, 1.0 is maximum smoothing")
 @click.option('--motion-sigma', type=float, default=0.3, help="smooth the motion estimate spatially, 0.0 is no smoothing, used as sigma for gaussian blur")
+# debugging/progress options
 @click.option('--show-detector/--no-show-detector', is_flag=True, default=False, help="show the controlnet detector output")
 @click.option('--show-input/--no-show-input', is_flag=True, default=False, help="show the input frame")
 @click.option('--show-output/--no-show-output', is_flag=True, default=True, help="show the output frame")
@@ -559,9 +584,11 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 @click.option('--dump-frames', type=click.Path(), default=None, help="write intermediate frame images to a file/files during processing to visualise progress. may contain various {} placeholders")
 @click.option('--skip-dumped-frames', is_flag=True, default=False, help="read dumped frames from a previous run instead of processing the input video")
 @click.option('--dump-video', is_flag=True, default=False, help="write intermediate dump images to the final video instead of just the final output image")
+# Color-drift fixing options
 @click.option('--color-fix', type=click.Choice(['none', 'rgb', 'hsv', 'lab']), default='lab', help="prevent color from drifting due to feedback and model bias by fixing the histogram to the first frame. specify colorspace for histogram matching, e.g. 'rgb' or 'hsv' or 'lab', or 'none' to disable.")
 @click.option('--color-amount', type=float, default=0.0, help="blend between the original color and the color matched version, 0.0-1.0")
 @click.option('--color-info', is_flag=True, default=False, help="print extra stats about the color content of the output to help debug color drift issues")
+# Detector-specific options
 @click.option('--canny-low-thr', type=float, default=100, help="canny edge detector lower threshold")
 @click.option('--canny-high-thr', type=float, default=200, help="canny edge detector higher threshold")
 @click.option('--mlsd-score-thr', type=float, default=0.1, help="mlsd line detector v threshold")

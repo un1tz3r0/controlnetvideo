@@ -1,5 +1,31 @@
 A CLI tool for applying Stable Diffusion Img2Img with ControlNets to videos, with stabilization provided by feeding back the prior output frame as a partial init image. The input frames are fed in as the ControlNet control image through the appropriate detector.
 
+# Installation
+
+## Pre-requisites
+
+You may wish to set up a venv and activate it before installing the dependencies. 
+
+```
+python3 -m venv venv
+source venv/bin/activate
+```
+
+Now, install the dependencies using pip3:
+
+```
+pip3 install \
+  diffusers \
+  torch \
+  torchvision \
+  xformers \
+  click \
+  moviepy \
+  opencv-python \
+  controlnet_aux \
+  transformers
+```
+
 # Example
 
 To process a video using _Stable Diffusion 2.1_ and a _ControlNet_ trained for __depth-to-image__ generation:
@@ -38,7 +64,7 @@ Finally, it will also encode and write the output to a video file `PXL_20230422_
 Here's another example of the same video, but with a different prompt and different parameters:
 
 ```
-ipython3 --pdb ../controlnetvideo.py -- \
+python3 controlnetvideo.py \
         PXL_20230419_205030311.TS.mp4 \
         --controlnet depth21 \
         --prompt 'mirrorverse colorful intricate heavy detailed outlines' \
