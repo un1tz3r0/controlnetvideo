@@ -55,11 +55,11 @@ This will process the file PXL_20230422_013745844.TS.mp4, starting at 10 seconds
 
 During processing, it will show the input, the detector output, the motion estimate, and the output frames, by writing them to a combined image in a directory `PXL_20230422_013745844.TS_frames/`. If you just want a single image file you can watch with a viewer which auto-refreshes upon the file changing on disk, then you can specify a --dump-frames without the `{n}` substitution, which is what causes the numbered files to be generated. 
 
-<img src="./examples/00000339.png"/>
+<img src="./examples/00000339.png" />
 
 Finally, it will also encode and write the output to a video file `PXL_20230422_013745844.TS_out.mp4`.
 
-<video src="./examples/PXL_20230422_013745844.TSb_out.mp4"></video>
+<video src="./examples/PXL_20230422_013745844.TSb_out.mp4" ></video>
 
 Here's another example of the same video, but with a different prompt and different parameters:
 
@@ -89,7 +89,7 @@ And a progress frame:
 
 And the output video:
 
-<video src="./examples/PXL_20230422_013745844.TSb_out.mp4"></video>
+<video href="./examples/PXL_20230422_013745844.TSb_out.mp4"></video>
 
 
 # Usage
