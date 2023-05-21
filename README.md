@@ -2,18 +2,27 @@ A CLI tool for applying __Stable Diffusion__ &times; __ControlNets__ to videos, 
 
 # Installation
 
-## Pre-requisites
+### Pre-requisites
 
-You may wish to set up a __venv__ and activate it before installing the dependencies. 
+First, clone this repo using git
 
+```sh
+git clone https://github.com/un1tz3r0/controlnetvideo.git
+cd controlnetvideo
 ```
+
+You may wish to set up a __venv__. This is not strictly nescessary, so skip this step to use user/system-wide packages at your own risk, may break other projects whose dependencies are out of date.
+
+```sh
 python3 -m venv venv
 source venv/bin/activate
 ```
 
+### Dependecies
+
 Now, install the dependencies using pip3:
 
-```
+```sh
 pip3 install \
   diffusers \
   torch \
@@ -25,6 +34,8 @@ pip3 install \
   controlnet_aux \
   transformers
 ```
+
+You should now be ready to run the script and process video files. If you are having trouble getting it working, open an issue or reach out on twitter or discord...
 
 # Example
 
@@ -55,11 +66,11 @@ This will process the file PXL_20230422_013745844.TS.mp4, starting at 10 seconds
 
 During processing, it will show the input, the detector output, the motion estimate, and the output frames, by writing them to a combined image in a directory `PXL_20230422_013745844.TS_frames/`. If you just want a single image file you can watch with a viewer which auto-refreshes upon the file changing on disk, then you can specify a --dump-frames without the `{n}` substitution, which is what causes the numbered files to be generated. 
 
-<img src="./examples/00000339.png" />
+![example frame dump showing video processing progress](./examples/00000339.png)
 
 Finally, it will also encode and write the output to a video file `PXL_20230422_013745844.TS_out.mp4`.
 
-<video src="./examples/PXL_20230422_013745844.TSb_out.mp4" ></video>
+![example output stylized video](./examples/PXL_20230422_013745844.TSb_out.mp4)
 
 Here's another example of the same video, but with a different prompt and different parameters:
 
@@ -85,12 +96,17 @@ python3 controlnetvideo.py \
 
 And a progress frame:
 
-<img src="./examples/00001750.png"/>
+![example frame dump](./examples/00001750.png)
 
 And the output video:
 
-<video href="./examples/PXL_20230422_013745844.TSb_out.mp4"></video>
+![example stylized output video](./examples/PXL_20230422_013745844.TSb_out.mp4)
 
+### Tips
+
+- If your video comes out squashed or the wrong aspect ratio, try `--no-fix-orientation` or `--fix-orientation`. You can also mess with the scaling using `--max-dimension` and `--min-dimension` and `--round-dims-to`, although these should all be sane defaults that just work with most sources.
+
+- Feedback strength, set with `--init-image-strength` controls frame-to-frame consistency, by changing how much the motion-compensated previous output frame is fed into the next frame's diffusion pipeline in place of initial latent noise, _a la_ img2img latent diffusion (_citation needed_). Values around 0.3 to 0.5 and sometimes much higher (closer to 1.0, the maximum which means no noise is added and no denoising steps will be run).
 
 # Usage
 
