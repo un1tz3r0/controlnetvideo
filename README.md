@@ -59,7 +59,7 @@ During processing, it will show the input, the detector output, the motion estim
 
 Finally, it will also encode and write the output to a video file `PXL_20230422_013745844.TS_out.mp4`.
 
-<video src="./examples/PXL_20230422_013745844.TSb_out.mp4"/>
+<video href="./examples/PXL_20230422_013745844.TSb_out.mp4"></video>
 
 Here's another example of the same video, but with a different prompt and different parameters:
 
@@ -89,7 +89,7 @@ And a progress frame:
 
 And the output video:
 
-<video src="./examples/PXL_20230422_013745844.TSb_out.mp4"/>
+<video href="./examples/PXL_20230422_013745844.TSb_out.mp4"></video>
 
 
 # Usage
