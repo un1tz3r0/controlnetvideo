@@ -1,6 +1,14 @@
-A CLI tool for applying __Stable Diffusion__ &times; __ControlNets__ to videos, with stabilization provided by feeding back the prior output frame as a partial init image. The input frames are fed in as the ControlNet control image through the appropriate detector.
+# Stable Diffusion Video2Video ControlNet Model
 
-# Installation
+##### by Victor Condino <un1tz3r0@gmail.com>
+##### May 21 2023
+
+This file contains the code for the video2video controlnet model, which can apply Stable
+Diffusion to a video, while maintaining frame-to-frame consistency.	It is based on the
+Stable Diffusion img2img model, but adds a motion estimator and motion compensator to
+maintain consistency between frames.
+
+## Installation
 
 ### Pre-requisites
 
@@ -37,7 +45,7 @@ pip3 install \
 
 You should now be ready to run the script and process video files. If you are having trouble getting it working, open an issue or reach out on twitter or discord...
 
-# Example
+## Example 1
 
 To process a video using _Stable Diffusion 2.1_ and a _ControlNet_ trained for __depth-to-image__ generation:
 
@@ -62,10 +70,9 @@ python3 controlnetvideo.py \
 	'{instem}_out.mp4'
 ```
 
-This will process the file `PXL_20230422_013745844.TS.mp4`, starting at `10 seconds` for a duration of `60 seconds`. It will process each input frame with some preprocessing (motion transfer/compensation of the output feedback), followed by a detector and diffusion models in a pipeline configured by the `--controlnet` option. Here, it is `depth21`, which selects Midas depth estimator for the detector and the `Stable Diffusion 2.1` model and the matching pretrained ControlNet model, in this case courtesy of [thibaud](https://huggingface.co/thibaud/). for `15` steps the first frame and 
-`(1.0-0.4)*15 => 9` steps (this is because img2img skips initial denoising steps according to the init-image strength) for the remaining frames. The diffusion pipeline will be run with the prompt `'graffuturism colorful intricate heavy detailed outlines'` with a guidance strength of `9`, and full controlnet guidance strength. 
+This will process the file `PXL_20230422_013745844.TS.mp4`, starting at `10 seconds` for a duration of `60 seconds`. It will process each input frame with some preprocessing (motion transfer/compensation of the output feedback), followed by a detector and diffusion models in a pipeline configured by the `--controlnet` option. Here, we are using `depth21`, which selects __Midas__ depth estimator for the detector and the __Stable Diffusion 2.1__ model and the matching pretrained __ControlNet__ model, in this case courtesy of [thibaud](https://huggingface.co/thibaud/), for `15` steps the first frame and `(1.0-0.4)*15 => 9` steps (this is because img2img skips initial denoising steps according to the init-image strength) for the remaining frames. The diffusion pipeline will be run with the prompt `'graffuturism colorful intricate heavy detailed outlines'` with a guidance strength of `9`, and full controlnet influence.
 
-During processing, it will show the input, the detector output, the motion estimate, and the output frames, by writing them to a combined image in a directory `PXL_20230422_013745844.TS_frames/`. If you just want a single image file you can watch with a viewer which auto-refreshes upon the file changing on disk, then you can specify a --dump-frames without the `{n}` substitution, which is what causes the numbered files to be generated. 
+During processing, it will show the input, the detector output, the motion estimate, and the output of each frame, by writing them to numbered `.png` image files in a directory `PXL_20230422_013745844.TS_frames/` which will be created if it does not exist. If you just want a single image file you can watch with a viewer which auto-refreshes upon the file changing on disk, then you can specify the filename to `--dump-frames` without a `{n}` substitution, causing it to continually overwrite the same file. This is useful for watching the progress of the video processing in real time. 
 
 ![example frame dump showing video processing progress](./examples/00000339.png)
 
@@ -73,6 +80,7 @@ Finally, it will also encode and write the output to a video file `PXL_20230422_
 
 https://github.com/un1tz3r0/controlnetvideo/assets/851283/00166ca1-6eb6-46ce-aba9-4e0d019ab31a
 
+### Example 2
 
 Here's another example of the same video, but with a different prompt and different parameters:
 
@@ -96,11 +104,11 @@ python3 controlnetvideo.py \
         '{instem}_out.mp4'
 ```
 
-And a progress frame:
+The frames dumped will look like this:
 
 ![example frame dump](./examples/00001750.png)
 
-And the output video:
+And the resulting output video:
 
 https://github.com/un1tz3r0/controlnetvideo/assets/851283/550ff6c7-5be3-4cf0-a25c-603461b8f791
 
@@ -111,7 +119,16 @@ https://github.com/un1tz3r0/controlnetvideo/assets/851283/550ff6c7-5be3-4cf0-a25
 
 - Feedback strength, set with `--init-image-strength` controls frame-to-frame consistency, by changing how much the motion-compensated previous output frame is fed into the next frame's diffusion pipeline in place of initial latent noise, _a la_ img2img latent diffusion (_citation needed_). Values around 0.3 to 0.5 and sometimes much higher (closer to 1.0, the maximum which means no noise is added and no denoising steps will be run).
 
-# Usage
+- See --help (below) for more options, there are many features not covered here, such as:
+  - detector kwargs
+  - original input frame feedthrough strength
+  - motion estimate spatiotemporal smoothing (crude, simple exponential and gaussian filters, but it can help in some situations give better results if the motion estimate is noisy)
+  - color drift correction, and more.
+  - more things I forgot to mention
+
+If there is interest, I will write up a more detailed guide to the options and how to use them.
+
+## Usage
 
 ```
 Usage: controlnetvideo.py [OPTIONS] INPUT_VIDEO OUTPUT_VIDEO
