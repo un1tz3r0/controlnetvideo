@@ -71,7 +71,8 @@ During processing, it will show the input, the detector output, the motion estim
 
 Finally, it will also encode and write the output to a video file `PXL_20230422_013745844.TS_out.mp4`.
 
-![example output stylized video](./examples/PXL_20230422_013745844.TSb_out.mp4)
+https://github.com/un1tz3r0/controlnetvideo/assets/851283/00166ca1-6eb6-46ce-aba9-4e0d019ab31a
+
 
 Here's another example of the same video, but with a different prompt and different parameters:
 
@@ -101,7 +102,8 @@ And a progress frame:
 
 And the output video:
 
-![example stylized output video](./examples/PXL_20230422_013745844.TSb_out.mp4)
+https://github.com/un1tz3r0/controlnetvideo/assets/851283/550ff6c7-5be3-4cf0-a25c-603461b8f791
+
 
 ### Tips
 
