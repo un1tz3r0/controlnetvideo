@@ -1,6 +1,17 @@
-"""
-!pip install -q transformers xformers accelerate git+https://github.com/huggingface/accelerate.git
-!pip install -q git+https://github.com/mikegarts/diffusers.git@stablediffusion.controlnet.img2img.pipeline
+""" 
+---------------------------------------------------------------------------------------------
+controlnetvideo.py
+
+Stable Diffusion Video2Video ControlNet Model
+
+by Victor Condino <un1tz3r0@gmail.com>
+May 21 2023
+
+This file contains the code for the video2video controlnet model, which can apply Stable
+Diffusion to a video, while maintaining frame-to-frame consistency.	It is based on the
+Stable Diffusion img2img model, but adds a motion estimator and motion compensator to
+maintain consistency between frames.
+---------------------------------------------------------------------------------------------
 """
 
 import click

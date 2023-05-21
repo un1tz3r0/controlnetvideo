@@ -62,7 +62,8 @@ python3 controlnetvideo.py \
 	'{instem}_out.mp4'
 ```
 
-This will process the file PXL_20230422_013745844.TS.mp4, starting at 10 seconds for a duration of 60 seconds. It will process each input frame using the appropriate detector for the pretrained _ControlNet_ for __depth-to-image__ generation, and then diffuse for 15 steps the first frame and `int( (1 - init-strength:0.4) * steps:15) = 9` steps all following frames, with the prompt 'graffuturism colorful intricate heavy detailed outlines' with a strength of 9, and full controlnet guidance strength. 
+This will process the file `PXL_20230422_013745844.TS.mp4`, starting at `10 seconds` for a duration of `60 seconds`. It will process each input frame with some preprocessing (motion transfer/compensation of the output feedback), followed by a detector and diffusion models in a pipeline configured by the `--controlnet` option. Here, it is `depth21`, which selects Midas depth estimator for the detector and the `Stable Diffusion 2.1` model and the matching pretrained ControlNet model, in this case courtesy of [thibaud](https://huggingface.co/thibaud/). for `15` steps the first frame and 
+`(1.0-0.4)*15 => 9` steps (this is because img2img skips initial denoising steps according to the init-image strength) for the remaining frames. The diffusion pipeline will be run with the prompt `'graffuturism colorful intricate heavy detailed outlines'` with a guidance strength of `9`, and full controlnet guidance strength. 
 
 During processing, it will show the input, the detector output, the motion estimate, and the output frames, by writing them to a combined image in a directory `PXL_20230422_013745844.TS_frames/`. If you just want a single image file you can watch with a viewer which auto-refreshes upon the file changing on disk, then you can specify a --dump-frames without the `{n}` substitution, which is what causes the numbered files to be generated. 
 
