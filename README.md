@@ -3,12 +3,25 @@
 ##### by Victor Condino <un1tz3r0@gmail.com>
 ##### May 21 2023
 
-This file contains the code for the video2video controlnet model, which can apply Stable
-Diffusion to a video, while maintaining frame-to-frame consistency.	It is based on the
+This file contains the code for a simple img2img-controlnet video processor, which can apply Stable
+Diffusion to a video while attempting to maintain frame-to-frame consistency.	It is based on the
 Stable Diffusion img2img model, but adds a motion estimator and motion compensator to
 maintain consistency between frames.
 
-## Installation
+### New as of Oct 2024 -- Flux, SDXL Reference
+
+I've added support for **Flux.1** and **SDXL controlnet** and **reference-only** control schemes. See below for some examples...
+
+#### Some examples of sdxl img2img reference
+
+These videos were made with the 'refxl' controlnet option, which is an implementation of reference-only control for sdxl img2img. Effects are interesting. Needs more experimentation.
+
+`./venv/bin/python3 controlnetvideo.py examples/PXL_20240827_063831973.TS.mp4 examples/outh-2.mp4 --prompt kowloon\ walled\ city\ manifold\ garden\ pixel\ perfect\ anton\ fadeev\ studio\ ghibli\ miyazaki\ city\ streets --dump-frames progress.png --show-input --show-output --show-motion --color-info --motion-sigma 0.1 --motion-alpha 0.1</b> --color-fix none --feedthrough-strength 0.08 --swap-images --init-image-strength 0.60 --controlnet refxl`
+
+`./venv/bin/python3 controlnetvideo.py examples/PXL_20240827_063831973.TS.mp4 examples/outh-3.mp4 --prompt manifold\ garden\ cityscape\ billowing\ clouds\ of\ thick\ clored\ smoke\ anton\ fadeev\ studio\ ghibli\ miyazaki\ city\ streets --dump-frames progress.png --show-input --show-output --show-motion --color-info --motion-sigma 0.1 --motion-alpha 0.1</b> --color-fix none <b>--feedthrough-strength 0.2 --swap-images --init-image-strength 0.53 --controlnet refxl`
+
+
+# Installation
 
 ### Pre-requisites
 
@@ -31,16 +44,7 @@ source venv/bin/activate
 Now, install the dependencies using pip3:
 
 ```sh
-pip3 install \
-  diffusers \
-  torch \
-  torchvision \
-  xformers \
-  click \
-  moviepy \
-  opencv-python \
-  controlnet_aux \
-  transformers
+pip3 install -r requirements.txt
 ```
 
 You should now be ready to run the script and process video files. If you are having trouble getting it working, open an issue or reach out on twitter or discord...
@@ -134,13 +138,29 @@ If there is interest, I will write up a more detailed guide to the options and h
 Usage: controlnetvideo.py [OPTIONS] INPUT_VIDEO OUTPUT_VIDEO
 
 Options:
+  --overwrite / --no-overwrite    don't overwrite existing output file -- add
+                                  a numeric suffix to get a unique filename.
+                                  default: --no-overwrite.
   --start-time FLOAT              start time in seconds
   --end-time FLOAT                end time in seconds
   --duration FLOAT                duration in seconds
+  --output-bitrate TEXT           output bitrate for the video, e.g. '16M'
+  --output-codec TEXT             output codec for the video, e.g. 'libx264'
   --max-dimension INTEGER         maximum dimension of the video
   --min-dimension INTEGER         minimum dimension of the video
   --round-dims-to INTEGER         round the dimensions to the nearest multiple
                                   of this number
+  --fix-orientation / --no-fix-orientation
+                                  resize videos shot in portrait mode on some
+                                  devices to fix incorrect aspect ratio bug
+  --no-audio                      don't include audio in the output video,
+                                  even if the input video has audio
+  --audio-from PATH               audio file to use for the output video,
+                                  replaces the audio from the input video,
+                                  will be truncated to duration of input or
+                                  --duration if given
+  --audio-offset FLOAT            offset in seconds to start the audio from,
+                                  when used with --audio-from
   --prompt TEXT                   prompt used to guide the denoising process
   --negative-prompt TEXT          negative prompt, can be used to prevent the
                                   model from generating certain words
@@ -150,14 +170,14 @@ Options:
                                   number of inference steps, depends on the
                                   scheduler, trades off speed for quality.
                                   20-50 is a good range from fastest to best.
-  --controlnet [aesthetic|lineart21|hed|hed21|canny|canny21|openpose|openpose21|depth|depth21|normal|mlsd]
-                                  which pretrained controlnet annotator to use
+  --controlnet [refxl|fluxcanny|depthxl|aesthetic|lineart21|hed|hed21|canny|canny21|openpose|openpose21|depth|depth21|normal|mlsd]
+                                  which pretrained model and controlnet type
+                                  to use. the default, depthxl, uses the dpt
+                                  depth estimator and controlnet with the sdxl
+                                  base model
   --controlnet-strength FLOAT     how much influence the controlnet
                                   annotator's output is used to guide the
                                   denoising process
-  --fix-orientation / --no-fix-orientation
-                                  resize videos shot in portrait mode on some
-                                  devices to fix incorrect aspect ratio bug
   --init-image-strength FLOAT     the init-image strength, or how much of the
                                   prompt-guided denoising process to skip in
                                   favor of starting with an existing image
@@ -198,6 +218,7 @@ Options:
   --canny-high-thr FLOAT          canny edge detector higher threshold
   --mlsd-score-thr FLOAT          mlsd line detector v threshold
   --mlsd-dist-thr FLOAT           mlsd line detector d threshold
+  --swap-images                   Switch the init and reference images when
+                                  using reference-only controlnet
   --help                          Show this message and exit.
-
 ```
