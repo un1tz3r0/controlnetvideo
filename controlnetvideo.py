@@ -2,18 +2,28 @@
 ---------------------------------------------------------------------------------------------
 controlnetvideo.py
 
-Stable Diffusion Video2Video ControlNet Model
+Stable Diffusion Video2Video with Feedback
 
 by Victor Condino <un1tz3r0@gmail.com>
-May 21 2023
+May 21 2023 - Initial Commit
+Sept 2024 - Added SDXL controlnet support
+Oct 2024 - Added Flux controlnet, and sdxl reference-only, which is my favorite so far
 
-This file contains the code for the video2video controlnet model, which can apply Stable
-Diffusion to a video, while maintaining frame-to-frame consistency.	It is based on the
-Stable Diffusion img2img model, but adds a motion estimator and motion compensator to
-maintain consistency between frames.
+This python script is a command line tool for rerendering videos with stable diffusion
+models, making use of huggingface diffusers library and various other open source projects.
+It attempts to solve the problem of frame-to-frame consistency by various methods, primarily
+motion transfer from dense optical flow of the input to the output, fed back either using
+controlnets or reference only attention coupling. This is not the right way to do this,
+clearly the models need to be extended to allow temporal information passing between frames
+and trained on video datasets, which, in the time since this scripts first incarnation, has
+proven very effective. I maintain this script and the techniques it uses as a curious and
+aesthetically interesting aside. Enjoy
+	- V.M.C (2024/10/10)
+
 ---------------------------------------------------------------------------------------------
 """
 
+from ctypes import ArgumentError
 import click
 import numpy as np
 import torch
@@ -29,6 +39,14 @@ import pathlib
 from transformers import DPTImageProcessor, DPTForDepthEstimation
 from diffusers import ControlNetModel, StableDiffusionXLControlNetImg2ImgPipeline, AutoencoderKL
 
+# ---------------------------------------------------------------------------------------------
+# audio reactivity
+#
+# Add a soundtrack to the animation and use MadMom's music information retrieval pretrained
+# deep neural networks to sync up the animation with the music.
+# ---------------------------------------------------------------------------------------------
+
+import extract_beats
 
 # ---------------------------------------------------------------------------------------------
 # Motion estimation using the RAFT optical flow model (and some legacy
@@ -507,7 +525,7 @@ def histomatch(source, template):
 	return interp_t_values[bin_idx].reshape(oldshape)
 
 from skimage.exposure import match_histograms
-import cv2
+import cv2, math
 
 def maintain_colors(color_match_sample, prev_img, mode, amount=1.0):
 		''' adjust output frame to match histogram of first output frame,
@@ -529,13 +547,40 @@ def maintain_colors(color_match_sample, prev_img, mode, amount=1.0):
 
 # ----------------------------------------------------------------------------------------------
 
-def process_frames(input_video, output_video, wrapped, start_time=None, end_time=None, duration=None, max_dimension=None, min_dimension=None, round_dims_to=None, fix_orientation=False, output_bitrate="16M", output_codec="libx264"):
+def process_frames(
+				input_video,
+				input_audio,
+				output_video,
+				wrapped,
+				start_time=None,
+				end_time=None,
+				duration=None,
+				rescale_time=None,
+				audio_params=None, # a dict of strings, keys are parameter names, and values are PiecewiseFunctions to map the beat of the audio to changing values
+				max_dimension=None,
+				min_dimension=None,
+				round_dims_to=None,
+				fix_orientation=False,
+				output_bitrate="16M",
+				output_codec="libx264"):
+		from moviepy.audio.AudioClip import AudioArrayClip, AudioClip
 		from moviepy import editor as mp
 		from PIL import Image
 		from tqdm import tqdm
 
 		# Load the video
 		video = mp.VideoFileClip(input_video)
+
+		# load and analyze the audio if provided
+		if input_audio != None:
+			if audio_params == None or len(audio_params) == 0:
+				print(f"Warning! No audio animation parameters give, input audio file will just replace input video's soundtrack")
+			print(f"Analysing audio file {repr(input_audio)} for tempo and beat timings...")
+			audio, audiosig, beats = extract_beats.extract_beats(input_audio)
+		else:
+			if not (audio_params == None or len(audio_params) == 0):
+				raise ArgumentError("audio animation parameters given but no input audio file specified")
+			audio, audiosig, beats = (None, None, None)
 
 		# scale the video frames if a min/max size is given
 		if fix_orientation:
@@ -567,31 +612,59 @@ def process_frames(input_video, output_video, wrapped, start_time=None, end_time
 		if duration != None:
 			video = video.subclip(0, duration)
 
+		# trim video to length of audio if audio is shorter
+		if (not audio == None) and video.duration > len(audio)/1000.0:
+			print(f"Warning: input video is {video.duration - len(audio)/1000.0} seconds longer than input audio file, *truncating video* to {len(audio)/1000.0} seconds")
+			video = video.subclip(0, len(audio)/1000.0)
+		elif (not audio == None) and video.duration < len(audio)/1000.0:
+			print(f"Warning! input video is {len(audio)/1000.0 - video.duration} seconds longer than input audio file, *truncating audio* to {video.duration} seconds")
+			audio = audio[0:video.duration*1000.0]
+
+		if audio != None:
+			audio_param_curves = {k: extract_beats.parse_piecewise_function(v) for k,v in audio_params.items()}
+
 		# Create a new video with the processed frames
 		from time import monotonic
 		try:
 			framenum = 0
-			starttime = monotonic()
+			startedat = monotonic()
 			def wrapper(gf, t):
 				nonlocal framenum
-				nonlocal starttime
-				elapsed = monotonic() - starttime
+				nonlocal startedat
+				elapsed = monotonic() - startedat
 				if t > 0:
 					eta = (video.duration / t) * elapsed
 				else:
 					eta = 0
 				print(f"Processing frame {framenum} at time {t}/{video.duration} seconds... {elapsed:.2f}s elapsed, {eta:.2f}s estimated time remaining")
-				result = wrapped(framenum, PIL.Image.fromarray(gf(t)).resize((w,h)))
+				# apply song position to curves, to calculate parameters to pass to the wrapped frame processing function
+				frametime = framenum / video.fps
+				if audio != None:
+					bar, beat = extract_beats.time_to_songpos(frametime, beats)
+					params = {k: v(math.fmod(bar, 1.0)) for k,v in audio_param_curves.items()}
+				else:
+					bar, beat = None
+					params = {k: v(frametime/video.duration) for k,v in audio_param_curves.items()}
+				print(f"... process_frame({framenum}, <image>, {repr(params)}) with params calculated for x={math.fmod(bar, 1.0) if bar != None else frametime/video.duration}")
+				result = wrapped(framenum, PIL.Image.fromarray(gf(t)).resize((w,h)), **params)
 				framenum = framenum + 1
 				return np.asarray(result)
 
-			#video.fx(wrapper).write_videofile(output_video)
-			video.fl(wrapper, keep_duration=True).write_videofile(output_video, codec=output_codec, fps=video.fps, bitrate=output_bitrate)
-			#processed_video = mp.ImageSequenceClip([
-			#  np.array(wrapped(framenum, Image.fromarray(frame).resize((w,h))))
-			#    for framenum, frame in
-			#      enumerate(tqdm(video.iter_frames()))
-			#  ], fps=video.fps)
+			if rescale_time == None:
+				#video.fx(wrapper).write_videofile(output_video)
+				videoout = video.fl(wrapper, keep_duration=True)
+				if audio != None:
+					videoout.set_audio(extract_beats.audio_to_clip(audio))
+				videoout.write_videofile(output_video, codec=output_codec, fps=video.fps, bitrate=output_bitrate)
+			else:
+				raise NotImplementedError("rescale_time support is not implemented yet")
+				'''
+				processed_video = mp.ImageSequenceClip([
+				  np.array(wrapped(framenum, Image.fromarray(frame).resize((w,h))))
+				    for framenum, frame in
+				      enumerate(tqdm(video.iter_frames()))
+				  ], fps=video.fps)
+				'''
 		finally:
 			# save the video
 			#if processed_video != None:
@@ -631,8 +704,9 @@ def find_unused_filename(basename, fmt="-{:d}"):
 @click.option('--fix-orientation/--no-fix-orientation', is_flag=True, default=True, help="resize videos shot in portrait mode on some devices to fix incorrect aspect ratio bug")
 # not implemented... yet (coming soon: beat-reactive video processing):
 @click.option('--no-audio', is_flag=True, default=False, help="don't include audio in the output video, even if the input video has audio")
-@click.option('--audio-from', type=click.Path(exists=True), default=None, help="audio file to use for the output video, replaces the audio from the input video, will be truncated to duration of input or --duration if given")
+@click.option('--audio-from', type=click.Path(exists=True), default=None, help="audio file to use for the output video, replaces the audio from the input video, will be truncated to duration of input or --duration if given. tempo and bars are analyzed and can be used to drive animation with the --audio-animate parameter.")
 @click.option('--audio-offset', type=float, default=None, help="offset in seconds to start the audio from, when used with --audio-from")
+@click.option('--audio-animate', type=str, default=None, help="specify parameters and curves which should be animated according to the rhythm information detected in the soundtrack. format is: 'name=L x y C x y a b c d ...; name=...; ...', where name is an animatable parameter, L is a linear transition, and C is a cubic bezier curve, x is the position within a bar (four beats, starting on the downbeat) of the audio, and y is the parameter value at that point.")
 # stable diffusion options
 @click.option('--prompt', type=str, default=None, help="prompt used to guide the denoising process")
 @click.option('--negative-prompt', type=str, default=None, help="negative prompt, can be used to prevent the model from generating certain words")
@@ -668,7 +742,7 @@ def find_unused_filename(basename, fmt="-{:d}"):
 def main(input_video, output_video, overwrite, start_time, end_time,
 		duration, output_bitrate, output_codec,
 		max_dimension, min_dimension, round_dims_to,
-		no_audio, audio_from, audio_offset, prompt, negative_prompt,
+		no_audio, audio_from, audio_offset, audio_animate, prompt, negative_prompt,
 		prompt_strength, num_inference_steps, controlnet,
 		controlnet_strength, fix_orientation, init_image_strength,
 		feedthrough_strength, motion_alpha, motion_sigma,
@@ -677,7 +751,7 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 		color_fix, color_amount, color_info, canny_low_thr=None,
 		canny_high_thr=None, mlsd_score_thr=None, mlsd_dist_thr=None,
 		swap_images = False
-	):
+		):
 
 	# substitute {} placeholders in output_video with input_video basename
 	if output_video != None and input_video != None:
@@ -691,6 +765,30 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 				output_video = find_unused_filename(output_video)
 			print(f"Input video: {inputpath}")
 			print(F"Output video: {output_video}")
+	else:
+			raise ArgumentError(f"Must specify both input and output video filenames as positional arguments")
+
+	# split audio animation argument into a dict to pass into the processing function below
+	animatable_params = ["denoise", "feedthrough", "control", "guidance"]
+	if audio_animate != None:
+		audio_params = {}
+		for audio_anim_stmt in audio_animate.split(";"):
+			audio_anim_assign = audio_anim_stmt.split("=", 1)
+			if len(audio_anim_assign) < 2:
+				raise ArgumentError(f"Invalid --audio-animate argument: missing '=' assignment in section '{audio_anim_stmt}'!")
+			else:
+				key, val = audio_anim_assign
+				key = key.strip()
+				val = val.strip()
+				if key != "" and (animatable_params == None or key in animatable_params):
+					if key in audio_params.keys():
+						raise KeyError(f"Duplicate parameter in --audio-animate argument: '{key}' already specified once!")
+					audio_params[key] = val
+				else:
+					raise KeyError(f"Invalid parameter in --audio-animate argument: '{key}' is not one of {repr(animatable_params)}!")
+		print("Parsed {len(audio_params)} audio-animation parameter curves! Wheeeee...")
+	else:
+		audio_params = None
 
 	# run controlnet pipeline on video
 
@@ -914,7 +1012,7 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 	prev_predicted_output_frame = None
 	flow = None
 
-	def frame_filter(framenum, input_frame):
+	def frame_filter(framenum, input_frame, **params):
 		# state kept between frames
 		nonlocal prev_input_frame
 		nonlocal prev_input_gray
@@ -974,6 +1072,16 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 			control_image = control_image.resize((input_image.width, input_image.height))
 			ci = np.asarray(control_image)
 			#print(f"ci.shape={ci.shape} ci.min={ci.min()} ci.max={ci.max()} ci.mean={ci.mean()} ci.std={ci.std()}")
+
+		print(f"*** Params for this frame: \n*** {repr(params)}")
+		if "feedthrough" in params.keys():
+			feedthrough_strength = params["feedthrough"]
+		if "denoise" in params.keys():
+			init_image_strength = params["denoise"]
+		if "control" in params.keys():
+			controlnet_strength = params["control"]
+		if "guidance" in params.keys():
+			prompt_strength = params["guidance"]
 
 		if predicted_output_frame == None:
 			strength = feedthrough_strength * init_image_strength
@@ -1093,7 +1201,10 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 		else:
 			return output_frame
 
-	process_frames(input_video, output_video, frame_filter, start_time, end_time, duration, max_dimension, min_dimension, round_dims_to, fix_orientation, output_bitrate, output_codec)
+	process_frames(input_video, audio_from, output_video, frame_filter, start_time, end_time, duration,
+		None, # rescale_time
+		audio_params,
+		max_dimension, min_dimension, round_dims_to, fix_orientation, output_bitrate, output_codec)
 
 if __name__ == "__main__":
 	main()

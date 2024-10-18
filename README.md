@@ -1,25 +1,80 @@
-# Stable Diffusion Video2Video ControlNet Model
+# controlnetvideo
+#### Stable Diffusion Video2Video with Feedback
 
-##### by Victor Condino <un1tz3r0@gmail.com>
-##### May 21 2023
+<!-- This is a small command line tool which can apply Stable Diffusion models to a video
+while attempting to maintain frame-to-frame consistency.	It is based on the img2img pipeline,
+using controlnet with various preproccessors to rerender the input video, and adds a dense
+optical flow motion estimator to transfer motion from the input video to the output before feeding
+it back into the img2img pipeline as the initial latent.
 
-This file contains the code for a simple img2img-controlnet video processor, which can apply Stable
-Diffusion to a video while attempting to maintain frame-to-frame consistency.	It is based on the
-Stable Diffusion img2img model, but adds a motion estimator and motion compensator to
-maintain consistency between frames.
+- Victor Condino <un1tz3r0@gmail.com>, May 21 2023 -->
 
-### New as of Oct 2024 -- Flux, SDXL Reference
+This python script is a command line tool for rerendering videos with stable diffusion
+models, making use of huggingface diffusers library and various other open source projects.
+It attempts to solve the problem of frame-to-frame consistency by various methods, primarily
+motion transfer from dense optical flow of the input to the output, fed back either using
+controlnets or reference only attention coupling.
 
-I've added support for **Flux.1** and **SDXL controlnet** and **reference-only** control schemes. See below for some examples...
+This is not the right way to do this,
+clearly the models need to be extended to allow temporal information passing between frames
+and trained on video datasets, which, in the time since this scripts first incarnation, has
+proven very effective. I maintain this script and the techniques it uses as a curious and
+aesthetically interesting aside. Enjoy
 
-#### Some examples of sdxl img2img reference
+by Victor Condino <un1tz3r0@gmail.com>, Oct 17 2024
 
-These videos were made with the 'refxl' controlnet option, which is an implementation of reference-only control for sdxl img2img. Effects are interesting. Needs more experimentation.
+---
+
+#### New! Features
+
+- Supports **SDXL Reference Only (ADAIN)** (*best results*) and **ControlNet** (*experimental*)
+- Supports **SDXL ControlNets**
+- Music video *beat-synced animation*
+- Animation with *arbitrary piecewise cubic spline curves*
+- **Flux.1** (initial support, works, only canny controlnet supported)
+
+I've added some support for **Flux.1**, and extensive **SDXL** support; both **controlnet** and **reference-only** control schemes.
+
+Also new is an animation system that can sync parameter modulations to the beat of an audio file. This uses the [madmom](https://github.com/CPJKU/madmom) to analyze the audio, and allows specifying piecewise cubic bezier curves to modulate various parameters of the video processing in time with the downbeats detected in the audio track. (Examples coming soon.)
+
+#### Examples of `--animation-params ...` and `--audio-from ...`
+
+```sh
+controlnetvideo.py \
+	~/Downloads/PXL_20240922_094238715.TS.mp4 \
+	outw.mp4 \
+	--prompt "by takashi murakami" \
+	--dump-frames progress.png \
+	--show-input \
+	--show-output \
+	--show-motion \
+	--color-info \
+	--motion-sigma 3.0 \
+	--motion-alpha 0.5 \
+	--color-fix none \
+	--feedthrough-strength 0.00 \
+	--init-image-strength 0.35 \
+	--controlnet refxl \
+	--swap-images \
+	--audio-from "laundry shuffle short vers 2024-10-17 0433.flac" \
+	--audio-animate "feedthrough=L 0 0.8 L 1/32 0.8 L 1/16 0.0 L 1 0.0; \
+									 denoise=L 0 0.25 L 1/32 0.25 L 4/16 0.75 L 1 0.50; \
+									 guidance=L 0 3.0 L 1/16 3.0 L 2/16 9.0 L 1 7.0"
+```
+
+#### Examples of `--controlnet refxl` mode
+
+![example frame dump showing video processing progress](./examples/refxl-screenshot-1.png)
+
+
 
 `./venv/bin/python3 controlnetvideo.py examples/PXL_20240827_063831973.TS.mp4 examples/outh-2.mp4 --prompt kowloon\ walled\ city\ manifold\ garden\ pixel\ perfect\ anton\ fadeev\ studio\ ghibli\ miyazaki\ city\ streets --dump-frames progress.png --show-input --show-output --show-motion --color-info --motion-sigma 0.1 --motion-alpha 0.1</b> --color-fix none --feedthrough-strength 0.08 --swap-images --init-image-strength 0.60 --controlnet refxl`
 
 `./venv/bin/python3 controlnetvideo.py examples/PXL_20240827_063831973.TS.mp4 examples/outh-3.mp4 --prompt manifold\ garden\ cityscape\ billowing\ clouds\ of\ thick\ clored\ smoke\ anton\ fadeev\ studio\ ghibli\ miyazaki\ city\ streets --dump-frames progress.png --show-input --show-output --show-motion --color-info --motion-sigma 0.1 --motion-alpha 0.1</b> --color-fix none <b>--feedthrough-strength 0.2 --swap-images --init-image-strength 0.53 --controlnet refxl`
 
+These videos were made with the `--controlnet refxl` option, which is an implementation of reference-only control for sdxl img2img. Effects are interesting. Needs more experimentation.
+
+-----
 
 # Installation
 
@@ -76,7 +131,7 @@ python3 controlnetvideo.py \
 
 This will process the file `PXL_20230422_013745844.TS.mp4`, starting at `10 seconds` for a duration of `60 seconds`. It will process each input frame with some preprocessing (motion transfer/compensation of the output feedback), followed by a detector and diffusion models in a pipeline configured by the `--controlnet` option. Here, we are using `depth21`, which selects __Midas__ depth estimator for the detector and the __Stable Diffusion 2.1__ model and the matching pretrained __ControlNet__ model, in this case courtesy of [thibaud](https://huggingface.co/thibaud/), for `15` steps the first frame and `(1.0-0.4)*15 => 9` steps (this is because img2img skips initial denoising steps according to the init-image strength) for the remaining frames. The diffusion pipeline will be run with the prompt `'graffuturism colorful intricate heavy detailed outlines'` with a guidance strength of `9`, and full controlnet influence.
 
-During processing, it will show the input, the detector output, the motion estimate, and the output of each frame, by writing them to numbered `.png` image files in a directory `PXL_20230422_013745844.TS_frames/` which will be created if it does not exist. If you just want a single image file you can watch with a viewer which auto-refreshes upon the file changing on disk, then you can specify the filename to `--dump-frames` without a `{n}` substitution, causing it to continually overwrite the same file. This is useful for watching the progress of the video processing in real time. 
+During processing, it will show the input, the detector output, the motion estimate, and the output of each frame, by writing them to numbered `.png` image files in a directory `PXL_20230422_013745844.TS_frames/` which will be created if it does not exist. If you just want a single image file you can watch with a viewer which auto-refreshes upon the file changing on disk, then you can specify the filename to `--dump-frames` without a `{n}` substitution, causing it to continually overwrite the same file. This is useful for watching the progress of the video processing in real time.
 
 ![example frame dump showing video processing progress](./examples/00000339.png)
 
@@ -131,12 +186,11 @@ https://github.com/un1tz3r0/controlnetvideo/assets/851283/550ff6c7-5be3-4cf0-a25
   - more things I forgot to mention
 
 If there is interest, I will write up a more detailed guide to the options and how to use them.
-
-## Usage
-
-```
 Usage: controlnetvideo.py [OPTIONS] INPUT_VIDEO OUTPUT_VIDEO
 
+# Usage
+
+```
 Options:
   --overwrite / --no-overwrite    don't overwrite existing output file -- add
                                   a numeric suffix to get a unique filename.
@@ -158,9 +212,21 @@ Options:
   --audio-from PATH               audio file to use for the output video,
                                   replaces the audio from the input video,
                                   will be truncated to duration of input or
-                                  --duration if given
+                                  --duration if given. tempo and bars are
+                                  analyzed and can be used to drive animation
+                                  with the --audio-animate parameter.
   --audio-offset FLOAT            offset in seconds to start the audio from,
                                   when used with --audio-from
+  --audio-animate TEXT            specify parameters and curves which should
+                                  be animated according to the rhythm
+                                  information detected in the soundtrack.
+                                  format is: 'name=L x y C x y a b c d ...;
+                                  name=...; ...', where name is an animatable
+                                  parameter, L is a linear transition, and C
+                                  is a cubic bezier curve, x is the position
+                                  within a bar (four beats, starting on the
+                                  downbeat) of the audio, and y is the
+                                  parameter value at that point.
   --prompt TEXT                   prompt used to guide the denoising process
   --negative-prompt TEXT          negative prompt, can be used to prevent the
                                   model from generating certain words
@@ -222,3 +288,4 @@ Options:
                                   using reference-only controlnet
   --help                          Show this message and exit.
 ```
+

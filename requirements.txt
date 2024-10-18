@@ -13,3 +13,7 @@ tqdm
 #pipeline_flux_controlnet_image_to_image.py
 #pipeline_stable_diffusion_xl_img2img_reference.py
 #stable_diffusion_controlnet_img2img.py
+git+https://github.com/CPJKU/madmom
+click
+pydub
+
