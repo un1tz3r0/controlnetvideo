@@ -1,0 +1,85 @@
+[tool.poetry]
+name = "controlnetvideo"
+version = "0.1.0"
+description = "A Python project for video processing with ControlNet"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+click = "^8.0.0"
+numpy = "^1.21.0"
+torch = "^2.0.0"
+pillow = "^10.0.0"
+opencv-python = "^4.5.0"
+diffusers = {git = "https://github.com/huggingface/diffusers"}
+controlnet-aux = "^0.4.0"
+transformers = {git = "https://github.com/huggingface/transformers"}
+torchvision = "^0.15.0"
+scikit-image = "^0.21.0"
+moviepy = "^1.0.0"
+tqdm = "^4.65.0"
+madmom = {git = "https://github.com/CPJKU/madmom"}
+pydub = "^0.25.0"
+
+[tool.poetry.group.test.dependencies]
+pytest = "^7.4.0"
+pytest-cov = "^4.1.0"
+pytest-mock = "^3.11.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--cov=.",
+    "--cov-report=html:htmlcov",
+    "--cov-report=xml:coverage.xml",
+    "--cov-report=term-missing",
+    "--cov-fail-under=0",
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+    "--tb=short"
+]
+markers = [
+    "unit: marks tests as unit tests",
+    "integration: marks tests as integration tests", 
+    "slow: marks tests as slow running tests"
+]
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "venv/*",
+    ".venv/*",
+    "*/site-packages/*",
+    "__pycache__/*",
+    "*/migrations/*",
+    "setup.py"
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod"
+]
+show_missing = true
+precision = 2
+
+[tool.coverage.html]
+directory = "htmlcov"
