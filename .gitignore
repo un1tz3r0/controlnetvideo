@@ -15,3 +15,33 @@ logs/*
 logs
 shared/*
 shared
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.tox/
+
+# Claude Code settings
+.claude/*
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-*
+.DS_Store
+Thumbs.db
