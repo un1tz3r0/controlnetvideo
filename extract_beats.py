@@ -1,5 +1,6 @@
 from ast import Slice
 import pathlib
+import json
 from pydub import AudioSegment
 import madmom
 from madmom.features import DBNDownBeatTrackingProcessor, RNNDownBeatProcessor
@@ -7,6 +8,7 @@ import moviepy as mp
 from moviepy.audio.AudioClip import AudioArrayClip
 import numpy as np
 import PIL
+from tqdm import tqdm
 
 def audio_to_signal(audio):
 	'''
@@ -30,48 +32,266 @@ def audio_to_clip(audio):
 	clip = AudioArrayClip(data, fps=audio.frame_rate)
 	return clip
 
-def extract_beats(filename, starttime=None, endtime=None, duration=None):
-	# fix up missing arguments
-	if starttime == None:
+# ---------------------------------------------------------------------------------------------
+# beat-extraction cache + per-beat/per-bar RMS intensity
+#
+# Analysing audio with madmom's RNN/DBN downbeat tracker is slow, so results are cached to a
+# JSONL file next to the source (same name, '.jsonl' extension). Each line after the metadata
+# header is one beat: its time (decimal seconds, and frame@fps if an fps is given), its beat
+# number within the bar, and the RMS amplitude over the trailing beat- and bar-length windows
+# (a measure of song intensity and buildup/drop). On a cache hit the slow analysis is skipped.
+# ---------------------------------------------------------------------------------------------
+
+CACHE_VERSION = 1
+
+
+def beat_cache_path(filename, cache_path=None):
+	''' default cache path for a source file: same name with a .jsonl extension '''
+	if cache_path is not None:
+		return pathlib.Path(cache_path)
+	return pathlib.Path(filename).with_suffix('.jsonl')
+
+
+def read_beat_cache(path):
+	''' read a beat cache jsonl file, returning (meta_dict_or_None, list_of_entry_dicts) '''
+	meta = None
+	entries = []
+	with open(path, 'r') as f:
+		for line in f:
+			line = line.strip()
+			if not line:
+				continue
+			obj = json.loads(line)
+			if obj.get('_meta'):
+				meta = obj
+			else:
+				entries.append(obj)
+	return meta, entries
+
+
+def write_beat_cache(path, entries, meta):
+	''' write a beat cache jsonl file: one metadata header line followed by one line per beat '''
+	with open(path, 'w') as f:
+		f.write(json.dumps(meta) + "\n")
+		for e in entries:
+			f.write(json.dumps(e) + "\n")
+
+
+def _cache_is_valid(meta, starttime, endtime, samplerate):
+	''' a cache is reusable only if it covers the same crop and sample rate it was computed for '''
+	if meta is None or meta.get('version') != CACHE_VERSION:
+		return False
+	def close(a, b):
+		return abs((a if a is not None else 0.0) - (b if b is not None else 0.0)) < 1e-3
+	return (close(meta.get('starttime'), starttime) and
+	        close(meta.get('endtime'), endtime) and
+	        int(meta.get('samplerate', -1)) == int(samplerate))
+
+
+def _to_mono_float(sig):
+	''' return (mono samples peak-normalized to -1..1, sample_rate) from a madmom Signal / ndarray.
+
+	We normalize by the peak amplitude of the analysed region rather than by the dtype full
+	scale, so the resulting rms is a 0..1 intensity measure regardless of bit depth or whether
+	madmom handed us int16 samples or float samples still in integer range. '''
+	data = np.asarray(sig)
+	sr = int(getattr(sig, 'sample_rate', 44100))
+	if data.ndim > 1:
+		data = data.mean(axis=1)
+	data = data.astype(np.float64)
+	peak = float(np.max(np.abs(data))) if data.size else 0.0
+	if peak > 0:
+		data = data / peak
+	return data, sr
+
+
+def _rms_over(data, sr, t0, t1):
+	''' rms amplitude (0..1 of full scale) of the mono samples in the time window [t0, t1] seconds '''
+	if t1 <= t0:
+		return 0.0
+	i0 = max(0, int(round(t0 * sr)))
+	i1 = min(len(data), int(round(t1 * sr)))
+	if i1 <= i0:
+		return 0.0
+	seg = data[i0:i1]
+	return float(np.sqrt(np.mean(seg * seg)))
+
+
+def _build_beat_entries(raw_beats, sig, fps=None, show_progress=True):
+	''' turn a madmom (time, beatnum) array into rich per-beat entry dicts with rms intensity '''
+	data, sr = _to_mono_float(sig)
+	beats_list = [(float(t), int(round(b))) for t, b in raw_beats]
+	beats_per_bar = max((b for _, b in beats_list), default=4)
+	entries = []
+	it = tqdm(beats_list, desc="Computing beat/bar RMS", unit="beat") if show_progress else beats_list
+	for i, (t, b) in enumerate(it):
+		# beat window: from the previous beat up to this one
+		beat_t0 = beats_list[i - 1][0] if i > 0 else 0.0
+		beat_rms = _rms_over(data, sr, beat_t0, t)
+		# bar window: from one bar (beats_per_bar beats) ago up to this one
+		j = i - beats_per_bar
+		bar_t0 = beats_list[j][0] if j >= 0 else 0.0
+		bar_rms = _rms_over(data, sr, bar_t0, t)
+		entry = {"time": round(t, 6), "beat": b,
+		         "beat_rms": round(beat_rms, 6), "bar_rms": round(bar_rms, 6)}
+		if fps:
+			entry["frame"] = int(round(t * fps))
+		entries.append(entry)
+	return entries
+
+
+def _run_downbeat_analysis(sig, est_seconds=None):
+	''' run the (slow) madmom RNN+DBN downbeat tracker with a live progress bar '''
+	import threading
+	import time as _time
+
+	print(f"Analysing audio for tempo and downbeats...")
+	result = {}
+	error = {}
+
+	def _work():
+		try:
+			activations = RNNDownBeatProcessor()(sig)
+			result['beats'] = DBNDownBeatTrackingProcessor(
+				beats_per_bar=4, fps=100, min_bpm=55, max_bpm=185)(activations)
+		except Exception as e:  # surfaced on the main thread below
+			error['e'] = e
+
+	worker = threading.Thread(target=_work, daemon=True)
+	worker.start()
+
+	# the analysis is one long blocking call with no native progress hook, so we show an
+	# elapsed/ETA bar driven by a rough realtime estimate, snapping to 100% on completion
+	total = max(1, int(round(est_seconds or 30)))
+	start = _time.monotonic()
+	with tqdm(total=total, desc="Downbeat RNN", unit="s",
+	          bar_format="{desc}: {bar} {elapsed}<~{remaining}") as pbar:
+		while worker.is_alive():
+			worker.join(0.25)
+			elapsed = _time.monotonic() - start
+			pbar.n = min(int(elapsed), total - 1)
+			pbar.refresh()
+		pbar.n = total
+		pbar.refresh()
+
+	if 'e' in error:
+		raise error['e']
+	return result['beats']
+
+
+def _get_beats_cached(sig, filename, starttime, endtime, fps, use_cache, cache_path, est_seconds=None):
+	''' return (beats_list, entries), loading from / saving to the jsonl cache when possible '''
+	cpath = beat_cache_path(filename, cache_path)
+	samplerate = int(getattr(sig, 'sample_rate', 44100))
+
+	if use_cache and cpath.exists():
+		try:
+			meta, entries = read_beat_cache(cpath)
+			if _cache_is_valid(meta, starttime, endtime, samplerate):
+				print(f"Reusing cached beat analysis from {cpath} ({len(entries)} beats)")
+				# refresh the frame field for the requested fps without re-analysing
+				if fps:
+					for e in entries:
+						e["frame"] = int(round(e["time"] * fps))
+				beats = [(e["time"], e["beat"]) for e in entries]
+				return beats, entries
+			else:
+				print(f"Ignoring stale beat cache {cpath} (crop/samplerate differs), re-analysing...")
+		except Exception as e:
+			print(f"Could not read beat cache {cpath} ({e}), re-analysing...")
+
+	raw_beats = _run_downbeat_analysis(sig, est_seconds=est_seconds)
+	entries = _build_beat_entries(raw_beats, sig, fps=fps)
+	beats = [(e["time"], e["beat"]) for e in entries]
+
+	if use_cache:
+		meta = {"_meta": True, "version": CACHE_VERSION, "source": str(filename),
+		        "starttime": starttime, "endtime": endtime, "samplerate": samplerate,
+		        "beats_per_bar": 4, "fps": fps}
+		try:
+			write_beat_cache(cpath, entries, meta)
+			print(f"Saved beat analysis cache to {cpath}")
+		except Exception as e:
+			print(f"Warning: could not write beat cache {cpath}: {e}")
+
+	return beats, entries
+
+
+def _print_beat_stats(beats):
+	''' print a quick tempo/bar summary; robust to short clips with too few beats '''
+	beatcounts = {n: 0 for n in [1, 2, 3, 4]}
+	beatdiffs = {n: 0.0 for n in [1, 2, 3, 4]}
+	lastbeat = {n: None for n in [1, 2, 3, 4]}
+	for bt, bn in beats:
+		bn = int(bn)
+		if bn not in beatcounts:
+			continue
+		lt = lastbeat[bn]
+		lastbeat[bn] = bt
+		if lt is not None:
+			beatdiffs[bn] += bt - lt
+			beatcounts[bn] += 1
+	avgs = [beatdiffs[b] / beatcounts[b] for b in [1, 2, 3, 4] if beatcounts[b] > 0]
+	bars = sum(1 for bt, bn in beats if int(bn) == 1)
+	if avgs:
+		beatavg = sum(avgs) / len(avgs) / 4
+		print(f"Done. Tempo: {60.0 / beatavg:.1f} BPM. Bars: {bars}, Beats: {len(beats)}")
+	else:
+		print(f"Done. {len(beats)} beats detected (too few for tempo stats).")
+
+
+def _load_cropped_audio(filename, starttime, endtime, duration):
+	''' load an audio file with pydub and crop it to the requested region; returns (audio, starttime, endtime) '''
+	if starttime is None:
 		starttime = 0.0
-	if endtime == None and duration != None:
+	if endtime is None and duration is not None:
 		endtime = starttime + duration
-	elif endtime != None and duration == None:
+	elif endtime is not None and duration is None:
 		duration = endtime - starttime
-	# read the file using pydub
 	print(f"Reading audio track from file: {filename}")
 	audio = AudioSegment.from_file(pathlib.Path(filename))
-	origlen = len(audio)/1000.0
-	# crop the sample to the specified region, if needed
-	if endtime == None:
-		endtime = len(audio)/1000.0
-	audio = audio[starttime*1000:endtime*1000]
-	tlen = len(audio)
+	origlen = len(audio) / 1000.0
+	if endtime is None:
+		endtime = len(audio) / 1000.0
+	audio = audio[starttime * 1000:endtime * 1000]
 	print(f"Read {origlen}s of audio samples, clipped from {starttime} to {endtime}")
-	sig = audio_to_signal(audio)
-	print(f"Analysing audio for tempo and downbeats...")
-	beats = DBNDownBeatTrackingProcessor(beats_per_bar=4, fps=100, min_bpm=55, max_bpm=185)(RNNDownBeatProcessor()(sig))
-	# give some quick stats about the timing
-	firstbeat = {n: None for n in [1,2,3,4]}
-	lastbeat = {n: None for n in [1,2,3,4]}
-	beatcounts = {n: 0 for n in [1,2,3,4]}
-	beatdiffs = {n: 0.0 for n in [1,2,3,4]}
-	for time, beat in beats:
-		if firstbeat[int(beat)] != None:
-			firstbeat[int(beat)] = time
-		lasttime = lastbeat[int(beat)]
-		lastbeat[int(beat)] = time
-		if lasttime != None:
-			beatdiff = time-lasttime
-			beatdiffs[int(beat)] = beatdiffs[int(beat)] + beatdiff
-			beatcounts[int(beat)] = beatcounts[int(beat)] + 1
-		else:
-			beatdiff = None
-	beatavgs = [beatdiffs[beat]/beatcounts[beat] for beat in [1,2,3,4]]
-	beatavg = sum(beatavgs)/len(beatavgs)/4
-	print(f"Done. Tempo: {60.0/beatavg} BPM. Bars: {beatcounts[1]}")
+	return audio, starttime, endtime
 
+
+def extract_beats(filename, starttime=None, endtime=None, duration=None,
+                  fps=None, use_cache=True, cache_path=None):
+	'''
+	analyse (or load from cache) the downbeats of an audio file.
+
+	returns (audio, sig, beats) where beats is a list of (time_seconds, beat_number) pairs.
+	Results are cached to a '<name>.jsonl' file next to the source; pass use_cache=False to
+	force re-analysis or cache_path=... to override the location. If fps is given, the cached
+	entries also carry a frame index. The richer per-beat data (rms intensity) is available
+	via extract_beat_data().
+	'''
+	audio, starttime, endtime = _load_cropped_audio(filename, starttime, endtime, duration)
+	sig = audio_to_signal(audio)
+	beats, entries = _get_beats_cached(sig, filename, starttime, endtime, fps,
+	                                   use_cache, cache_path, est_seconds=len(audio) / 1000.0)
+	_print_beat_stats(beats)
 	return audio, sig, beats
+
+
+def extract_beat_data(filename, starttime=None, endtime=None, duration=None,
+                      fps=None, use_cache=True, cache_path=None):
+	'''
+	like extract_beats(), but returns the rich list of per-beat entry dicts:
+	{ "time": seconds, "beat": n, "beat_rms": ..., "bar_rms": ..., ["frame": k] }
+
+	beat_rms / bar_rms are the rms amplitude over the trailing beat- and bar-length windows,
+	a measure of intensity and buildup/drop useful for timing effect punch-in/out or edits.
+	'''
+	audio, starttime, endtime = _load_cropped_audio(filename, starttime, endtime, duration)
+	sig = audio_to_signal(audio)
+	beats, entries = _get_beats_cached(sig, filename, starttime, endtime, fps,
+	                                   use_cache, cache_path, est_seconds=len(audio) / 1000.0)
+	_print_beat_stats(beats)
+	return entries
 
 def count_bars(beats):
 	count = 0

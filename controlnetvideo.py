@@ -23,6 +23,15 @@ aesthetically interesting aside. Enjoy
 ---------------------------------------------------------------------------------------------
 """
 
+# fix collections.MutableSequence being moved to typing
+import collections, typing
+setattr(collections, "MutableSequence", typing.MutableSequence)
+# fix np.float deprecation
+import numpy
+setattr(numpy, "float", float)
+setattr(numpy, "int", int)
+
+
 from ctypes import ArgumentError
 import click
 import numpy as np
@@ -30,14 +39,16 @@ import torch
 import PIL.Image
 import cv2
 from PIL import Image
-#from diffusers import ControlNetModel, UniPCMultistepScheduler, EulerAncestralDiscreteScheduler
-#from stable_diffusion_controlnet_img2img import StableDiffusionControlNetImg2ImgPipeline
 from typing import Tuple, List, FrozenSet, Sequence, MutableSequence, Mapping, Optional, Any, Type, Union
-from controlnet_aux import CannyDetector #, OpenposeDetector, MLSDdetector, HEDdetector, MidasDetector
+from controlnet_aux import CannyDetector  # other detectors (openpose/hed/normal) are imported lazily in the unionxl branch
 import pathlib
 
 from transformers import DPTImageProcessor, DPTForDepthEstimation
 from diffusers import ControlNetModel, StableDiffusionXLControlNetImg2ImgPipeline, AutoencoderKL
+from diffusers import StableDiffusionXLControlNetUnionImg2ImgPipeline, ControlNetUnionModel
+
+# animatable video-filter chains (parsed once, applied at several points in the frame loop)
+import videofilters
 
 # ---------------------------------------------------------------------------------------------
 # audio reactivity
@@ -49,187 +60,12 @@ from diffusers import ControlNetModel, StableDiffusionXLControlNetImg2ImgPipelin
 import extract_beats
 
 # ---------------------------------------------------------------------------------------------
-# Motion estimation using the RAFT optical flow model (and some legacy
-# farneback code that is not currently used)
+# Motion estimation: pluggable dense optical flow (raft / raft_small / farneback / dis) with
+# shared flow smoothing. Lives in motionestimators.py; RAFT behaviour is preserved verbatim.
 # ---------------------------------------------------------------------------------------------
 
-from torchvision.models.optical_flow import raft_large
-from torchvision.models.optical_flow import Raft_Large_Weights
-import torchvision.transforms.functional
 import torch
-
-class RAFTMotionEstimator:
-	'''
-	Estimate dense optical flow using the RAFT model
-
-	this class is just a wrapper around the RAFT model, which is a pytorch model, and
-	provides a simple interface for estimating dense optical flow from one frame to
-	another, and for transferring the motion from one video to another, which we use
-	to motion compensate the output feedback into the next frame's img2img model input.
-
-	it's not the greatest way to achieve consistency, for sure, but it works with a
-	little fiddling.
-	'''
-	def __init__(self):
-		''' inits the RAFT motion estimator, loading the model and weights '''
-		self.raft_weights = Raft_Large_Weights.DEFAULT
-		self.raft_transforms = self.raft_weights.transforms()
-		self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-		self.raft_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(self.device)
-		self.raft_model = self.raft_model.eval()
-
-	def estimate_motion(self, srcframe1, srcframe2, prev_flow:Optional[np.ndarray] = None, alpha=0.0, sigma=0.0):
-		'''
-		estimate dense optical flow from srcframe1 to srcframe2, using the Raft model
-
-		exponential temporal smoothing is applied using the previous flow, according to
-		alpha, which should be between 0.0 and 1.0.  If alpha is 0.0, no temporal smoothing
-		is applied. the flow will be smoothed spatially using a gaussian filter with sigma
-		if sigma > 0.0.  If sigma is 0.0, no spatial smoothing is applied.
-		'''
-
-		# put the two frames into tensors
-		img1_batch = torch.tensor(np.asarray(srcframe1).transpose((2, 1, 0))).unsqueeze(0)
-		img2_batch = torch.tensor(np.asarray(srcframe2).transpose((2, 1, 0))).unsqueeze(0)
-
-		# resize the frames to multiples of 8 for the RAFT model (which requires this)
-		img1_batch = torchvision.transforms.functional.resize(img1_batch, size=[(srcframe1.width//8)*8, (srcframe1.height//8)*8], antialias=False)
-		img2_batch = torchvision.transforms.functional.resize(img2_batch, size=[(srcframe2.width//8)*8, (srcframe2.height//8)*8], antialias=False)
-
-		# apply the transforms required by the RAFT model
-		img1_batch, img2_batch = self.raft_transforms(img1_batch, img2_batch, )
-
-		# Compute the dense optical flow from frame1 to frame2
-		list_of_flows = self.raft_model(img1_batch.to(self.device), img2_batch.to(self.device))
-		flow = list_of_flows[0].cpu().detach().numpy()
-
-		if len(flow.shape) == 4:
-			if flow.shape[0] == 1:
-				flow = flow[0]
-		if flow.shape[0] == 2:
-			flow = np.transpose(flow, (2, 1, 0))
-
-		# smooth the flow spatially using a gaussian filter if sigma > 0.0
-		#if sigma > 0.0:
-		#	flow = cv2.bilateralFilter(flow, 9, sigma, sigma)
-		if sigma > 0.0:
-			flow = cv2.GaussianBlur(flow, (0,0), sigma)
-		# else:
-			#flow = flow[0]
-			#flow[...,0] = cv2.GaussianBlur(flow[...,0], (0, 0), sigma)
-			#flow[...,1] = cv2.GaussianBlur(flow[...,1], (0, 0), sigma)
-
-		# smooth the flow using exponential temporal smoothing if alpha is < 1.0
-		if not (prev_flow is None) and alpha > 0.0:
-			flow = prev_flow * alpha + flow * (1.0 - alpha)
-
-		# return the smoothed flow
-		return flow
-
-	def transfer_motion(self, flow, destframe, reverse_order=True):
-		'''
-		transfer motion from dense optical flow onto destframe^t-1 to get destframe^t
-
-		reverse order is used when the y axis is the first plane of the flow, and the x is the second,
-		as in the results from raft
-		'''
-		if len(flow.shape) == 4:
-			flow = np.transpose(flow[0], (2, 1, 0))
-
-		# Compute the inverse flow from frame2 to frame1
-		inv_flow = -flow
-		destframe = np.asarray(destframe)
-
-		# Warp frame3 using the inverse flow
-		h, w = destframe.shape[:2]
-		x, y = np.meshgrid(np.arange(w), np.arange(h))
-		x_inv = np.round(x + inv_flow[...,0 if not reverse_order else 1]).astype(np.float32)
-		y_inv = np.round(y + inv_flow[...,1 if not reverse_order else 0]).astype(np.float32)
-		x_inv = np.clip(x_inv, 0, w-1)
-		y_inv = np.clip(y_inv, 0, h-1)
-		warped = cv2.remap(np.asarray(destframe), x_inv, y_inv, cv2.INTER_LINEAR)
-
-		return PIL.Image.fromarray(warped)
-
-	def flow_to_image(self, flow):
-		if len(flow.shape) == 4:
-			flow = np.transpose(flow[0], (2, 1, 0))
-		''' convert dense optical flow to image, direction -> hue, magnitude -> brightness '''
-		hsv = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
-		hsv[...,1] = 255
-		mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
-		hsv[...,0] = ang*180/np.pi/2
-		hsv[...,2] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX)
-		rgb = cv2.cvtColor(hsv,cv2.COLOR_HSV2BGR)
-		return PIL.Image.fromarray(rgb)
-
-"""
-# not currently used...
-
-def extract_first_moment_from_flow(flow):
-	''' extract first moment from dense optical flow '''
-	moment = np.mean(flow, axis=(0,1))
-	flow = np.array(flow[:,:,:] - moment[None, None, :])
-	return flow, moment
-
-def estimate_motion_farneback(srcframe1, srcframe2, prev_flow:Optional[np.ndarray] = None, alpha=1.0, sigma=50.0):
-	''' given the current frame and the prior frame, estimate dense optical flow
-	for the motion between them. if the prior frame's estimated flow is provided,
-	use it as a hint for the current frame's flow. '''
-
-	# Convert the frames to grayscale
-	gray1 = cv2.cvtColor(np.asarray(srcframe1), cv2.COLOR_BGR2GRAY)
-	gray2 = cv2.cvtColor(np.asarray(srcframe2), cv2.COLOR_BGR2GRAY)
-
-	# Compute the dense optical flow from frame1 to frame2
-	if prev_flow is None:
-		flow2 = None
-	else:
-		flow2 = prev_flow.copy() # maybe copy is unnescessary
-
-	flow = cv2.calcOpticalFlowFarneback(gray1, gray2, flow2,
-			0.33, # pyr_scale: parameter, specifying the image scale (&lt;1) to build pyramids for each image; pyr_scale=0.5 means a classical pyramid, where each next layer is twice smaller than the previous one.
-			2, # levels: number of pyramid layers including the initial image; levels=1 means that no extra layers are created and only the original images are used.
-			30, # winsize: averaging window size; larger values increase the algorithm robustness to image noise and give more chances for fast motion detection, but yield more blurred motion field.
-			5, # iterations: number of iterations the algorithm does at each pyramid level.
-			13, # poly_n: size of the pixel neighborhood used to find polynomial expansion in each pixel; larger values mean that the image will be approximated with smoother surfaces, yielding more robust algorithm and more blurred motion field, typically poly_n =5 or 7.
-			2.7, # poly_sigma: standard deviation of the Gaussian that is used to smooth derivatives used as a basis for the polynomial expansion; for poly_n=5, you can set poly_sigma=1.1, for poly_n=7, a good value would be poly_sigma=1.5.
-			0 if flow2 is None else cv2.OPTFLOW_USE_INITIAL_FLOW)
-
-	if not (prev_flow is None):
-		smoothed_flow = prev_flow * (1-alpha) + flow * (alpha)
-	else:
-		smoothed_flow = flow
-	smoothed_flow = cv2.GaussianBlur(smoothed_flow, (0,0), sigma)
-
-	''' returns a tuple of (flow, smoothed_flow) where flow is the raw flow and smoothed_flow is
-	spatial and temporally smoothed flow. the smoothed flow should be used for motion transfer,
-	while the raw flow should be used for motion estimation on the next frame. '''
-	return flow, smoothed_flow
-
-def flow_to_image_farneback(flow):
-	''' convert dense optical flow to image, direction -> hue, magnitude -> brightness '''
-	hsv = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
-	hsv[...,1] = 255
-	mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
-	hsv[...,0] = ang*180/np.pi/2
-	hsv[...,2] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX)
-	rgb = cv2.cvtColor(hsv,cv2.COLOR_HSV2BGR)
-	return PIL.Image.fromarray(rgb)
-"""
-
-## never got this working yet, could significantly improve results
-#
-# def smooth_flow_spatiotemporal(flow, sigma:float):
-# 	''' smooth dense optical flow using a 3D edge-preserving filter. note implementing this
-# 	with opencv is quite possible but would require delaying the frame output due to the
-# 	nonlocal-means denoising algorithm's working on the middle frame of a temporal window
-# 	consisting of an odd number of frames so as to be symmetrical in lookahead and previously
-# 	seen frames. '''
-#
-# 	cv2.fastNlMeansDenoisingMulti(flow, flow, sigma, 0, 0)
-
-
+import motionestimators
 
 # -----------------------------------------------------------------------------------------------
 # helpers for depth-based controlnets
@@ -271,44 +107,6 @@ class DPTDepthDetectorWrapper:
 		image = torch.cat([depth_map] * 3, dim=1)
 		image = image.permute(0, 2, 3, 1).cpu().numpy()[0]
 		image = Image.fromarray((image * 255.0).clip(0, 255).astype(np.uint8))
-		return image
-
-# legacy stuff...
-
-class MidasDetectorWrapper:
-	''' a wrapper around the midas detector model which allows
-	choosing either the depth or the normal output on creation '''
-	def __init__(self, output_index=0, **kwargs):
-		self.model = MidasDetector()
-		self.output_index = output_index
-		self.default_kwargs = dict(kwargs)
-	def __call__(self, image, **kwargs):
-		ka = dict(list(self.default_kwargs.items()) + list(kwargs.items()))
-		#return torch.tensor(self.model(np.asarray(image), **ka)[self.output_index][None, :, :].repeat(3,0)).unsqueeze(0)
-		return PIL.Image.fromarray(self.model(np.asarray(image), **ka)[self.output_index]).convert("RGB")
-
-
-def depth_to_normal(image):
-		''' converts 2d 1ch (z) grayscale depth map image
-							to 2d 3ch (xyz) surface normal map image using sobel filter and cross product '''
-		image_depth = image.copy()
-		image_depth -= np.min(image_depth)
-		image_depth /= np.max(image_depth)
-
-		bg_threshold = 0.1
-
-		x = cv2.Sobel(image, cv2.CV_32F, 1, 0, ksize=3)
-		x[image_depth < bg_threshold] = 0
-
-		y = cv2.Sobel(image, cv2.CV_32F, 0, 1, ksize=3)
-		y[image_depth < bg_threshold] = 0
-
-		z = np.ones_like(x) * np.pi * 2.0
-
-		image = np.stack([x, y, z], axis=2)
-		image /= np.sum(image ** 2.0, axis=2, keepdims=True) ** 0.5
-		image = (image * 127.5 + 127.5).clip(0, 255).astype(np.uint8)
-		image = Image.fromarray(image)
 		return image
 
 # -----------------------------------------------------------------------------------------------
@@ -431,58 +229,6 @@ def rgbtohsl(rgb:np.ndarray):
 	hsl[:,:,2] = l
 	return hsl #np.ndarray([h, s, l])
 
-def hsltorgb(hsl:np.ndarray):
-	''' vectorized hsl to rgb conversion
-	input is a numpy array of shape (..., 3) and dtype float, with hue first in 0-360, then sat and lum in 0-1 '''
-	h, s, l = hsl[:,:,0], hsl[:,:,1], hsl[:,:,2]
-	c = (1 - np.abs(2*l-1)) * s
-	h = h / 60
-	x = c * (1 - np.abs(h % 2 - 1))
-	m = l - c/2
-	r = np.zeros(h.shape)
-	g = np.zeros(h.shape)
-	b = np.zeros(h.shape)
-	r[h < 1] = c[h < 1]
-	r[h >= 1] = x[h >= 1]
-	g[h < 1] = x[h < 1]
-	g[h >= 2] = c[h >= 2]
-	b[h < 2] = c[h < 2]
-	b[h >= 3] = x[h >= 3]
-	r[h >= 4] = c[h >= 4]
-	g[h >= 4] = x[h >= 4]
-	r += m
-	g += m
-	b += m
-	r *= 255
-	g *= 255
-	b *= 255
-	return np.ndarray([r, g, b])
-
-def hsltorgb(hsl:np.ndarray):
-	h, s, l = hsl[:,:,0], hsl[:,:,1], hsl[:,:,2]
-	c = (1 - np.abs(2*l-1)) * s
-	h = h / 60
-	x = c * (1 - np.abs(h % 2 - 1))
-	m = l - c/2
-	r = np.zeros(h.shape)
-	g = np.zeros(h.shape)
-	b = np.zeros(h.shape)
-	r[h < 1] = c[h < 1]
-	r[h >= 1] = x[h >= 1]
-	g[h < 1] = x[h < 1]
-	g[h >= 2] = c[h >= 2]
-	b[h < 2] = c[h < 2]
-	b[h >= 3] = x[h >= 3]
-	r[h >= 4] = c[h >= 4]
-	g[h >= 4] = x[h >= 4]
-	r += m
-	g += m
-	b += m
-	r *= 255
-	g *= 255
-	b *= 255
-	return np.ndarray([r, g, b])
-
 def brightcontrastmatch(source, template):
 	oldshape = source.shape
 	source = source.ravel()
@@ -564,7 +310,8 @@ def process_frames(
 				output_bitrate="16M",
 				output_codec="libx264"):
 		from moviepy.audio.AudioClip import AudioArrayClip, AudioClip
-		from moviepy import editor as mp
+		#from moviepy import editor as mp
+		import moviepy as mp
 		from PIL import Image
 		from tqdm import tqdm
 
@@ -576,7 +323,7 @@ def process_frames(
 			if audio_params == None or len(audio_params) == 0:
 				print(f"Warning! No audio animation parameters give, input audio file will just replace input video's soundtrack")
 			print(f"Analysing audio file {repr(input_audio)} for tempo and beat timings...")
-			audio, audiosig, beats = extract_beats.extract_beats(input_audio)
+			audio, audiosig, beats = extract_beats.extract_beats(input_audio, fps=video.fps)
 		else:
 			if not (audio_params == None or len(audio_params) == 0):
 				raise ArgumentError("audio animation parameters given but no input audio file specified")
@@ -620,7 +367,8 @@ def process_frames(
 			print(f"Warning! input video is {len(audio)/1000.0 - video.duration} seconds longer than input audio file, *truncating audio* to {video.duration} seconds")
 			audio = audio[0:video.duration*1000.0]
 
-		if audio != None:
+		audio_param_curves = {}
+		if audio != None and audio_params != None:
 			audio_param_curves = {k: extract_beats.parse_piecewise_function(v) for k,v in audio_params.items()}
 
 		# Create a new video with the processed frames
@@ -637,24 +385,27 @@ def process_frames(
 				else:
 					eta = 0
 				print(f"Processing frame {framenum} at time {t}/{video.duration} seconds... {elapsed:.2f}s elapsed, {eta:.2f}s estimated time remaining")
-				# apply song position to curves, to calculate parameters to pass to the wrapped frame processing function
+				# compute the animation position x (fractional bar with audio, else fraction of clip)
+				# and apply it to the audio-animate curves; x is also handed to the frame filter so
+				# its video-filter chains animate on the same timeline.
 				frametime = framenum / video.fps
-				if audio != None:
+				if audio != None and beats != None:
 					bar, beat = extract_beats.time_to_songpos(frametime, beats)
-					params = {k: v(math.fmod(bar, 1.0)) for k,v in audio_param_curves.items()}
+					anim_x = math.fmod(bar, 1.0)
 				else:
-					bar, beat = None
-					params = {k: v(frametime/video.duration) for k,v in audio_param_curves.items()}
-				print(f"... process_frame({framenum}, <image>, {repr(params)}) with params calculated for x={math.fmod(bar, 1.0) if bar != None else frametime/video.duration}")
-				result = wrapped(framenum, PIL.Image.fromarray(gf(t)).resize((w,h)), **params)
+					anim_x = (frametime / video.duration) if video.duration else 0.0
+				params = {k: v(anim_x) for k,v in audio_param_curves.items()}
+				print(f"... process_frame({framenum}, <image>, {repr(params)}) at x={anim_x:.4f}")
+				result = wrapped(framenum, PIL.Image.fromarray(gf(t)).resize((w,h)),
+					_anim_x=anim_x, _anim_fps=video.fps, **params)
 				framenum = framenum + 1
 				return np.asarray(result)
 
 			if rescale_time == None:
 				#video.fx(wrapper).write_videofile(output_video)
-				videoout = video.fl(wrapper, keep_duration=True)
+				videoout = video.transform(wrapper, keep_duration=True)
 				if audio != None:
-					videoout.set_audio(extract_beats.audio_to_clip(audio))
+					videoout.with_audio(extract_beats.audio_to_clip(audio))
 				videoout.write_videofile(output_video, codec=output_codec, fps=video.fps, bitrate=output_bitrate)
 			else:
 				raise NotImplementedError("rescale_time support is not implemented yet")
@@ -713,13 +464,24 @@ def find_unused_filename(basename, fmt="-{:d}"):
 @click.option('--prompt-strength', type=float, default=7.5, help="how much influence the prompt has on the output")
 #@click.option('--scheduler', type=click.Choice(['default']), default='default', help="which scheduler to use")
 @click.option('--num-inference-steps', '--steps', type=int, default=25, help="number of inference steps, depends on the scheduler, trades off speed for quality. 20-50 is a good range from fastest to best.")
-@click.option('--controlnet', type=click.Choice(['refxl', 'fluxcanny', 'depthxl', 'aesthetic', 'lineart21', 'hed', 'hed21', 'canny', 'canny21', 'openpose', 'openpose21', 'depth', 'depth21', 'normal', 'mlsd']), default='depthxl', help="which pretrained model and controlnet type to use. the default, depthxl, uses the dpt depth estimator and controlnet with the sdxl base model")
+@click.option('--controlnet', type=click.Choice(['unionxl', 'refxl', 'fluxcanny', 'depthxl']), default='depthxl', help="which pretrained model and conditioning to use. 'unionxl' = SDXL ControlNet-Union (one model, --control-type selects the conditioning); 'depthxl' = DPT depth + depth controlnet on SDXL; 'refxl' = SDXL reference-only; 'fluxcanny' = FLUX.1 with canny controlnet")
+@click.option('--control-type', type=click.Choice(['depth', 'canny', 'openpose', 'softedge', 'normal']), default='depth', help="for --controlnet unionxl: which conditioning the ControlNet-Union model is fed (selects the detector and the union control mode)")
+@click.option('--union-model', type=str, default='brad-twinkl/controlnet-union-sdxl-1.0-promax', help="huggingface repo for the SDXL ControlNet-Union model used by --controlnet unionxl")
+# IP-Adapter feedback (modern replacement for reference-only): inject the motion-warped previous
+# output as an image prompt to keep frame-to-frame consistency. supported with SDXL pipelines.
+@click.option('--ip-adapter/--no-ip-adapter', is_flag=True, default=False, help="enable IP-Adapter image-prompt feedback (SDXL): the warped previous output frame conditions the next frame")
+@click.option('--ip-adapter-scale', type=float, default=0.6, help="IP-Adapter image-prompt strength (0..1+); animatable via --audio-animate key 'ipadapter'")
+@click.option('--ip-adapter-source', type=click.Choice(['feedback', 'input', 'output']), default='feedback', help="which image to use as the IP-Adapter prompt: 'feedback'=motion-warped prev output, 'input'=current input frame, 'output'=prev output (un-warped)")
 @click.option('--controlnet-strength', type=float, default=1.0, help="how much influence the controlnet annotator's output is used to guide the denoising process")
 @click.option('--init-image-strength', type=float, default=0.5, help="the init-image strength, or how much of the prompt-guided denoising process to skip in favor of starting with an existing image")
 @click.option('--feedthrough-strength', type=float, default=0.0, help="the ratio of input to motion compensated prior output to feed through to the next frame")
-# motion smoothing options
+# motion estimation + smoothing options
+@click.option('--motion-estimator', type=click.Choice(['raft', 'raft_small', 'farneback', 'dis']), default='raft', help="dense optical flow method. 'raft' (default, GPU) is the original; 'raft_small' is lighter; 'farneback' and 'dis' are CPU (no GPU needed)")
 @click.option('--motion-alpha', type=float, default=0.0, help="smooth the motion vectors over time, 0.0 is no smoothing, 1.0 is maximum smoothing")
-@click.option('--motion-sigma', type=float, default=0.0, help="smooth the motion estimate spatially, 0.0 is no smoothing, used as sigma for gaussian blur")
+@click.option('--motion-sigma', type=float, default=0.0, help="smooth the motion estimate spatially, 0.0 is no smoothing, used as sigma for the spatial filter")
+@click.option('--motion-spatial-filter', type=click.Choice(['gaussian', 'bilateral']), default='gaussian', help="spatial flow smoothing kernel used with --motion-sigma: 'gaussian' (legacy) or 'bilateral' (edge-preserving, keeps motion boundaries)")
+@click.option('--motion-occlusion/--no-motion-occlusion', is_flag=True, default=False, help="occlusion-aware temporal smoothing: suppress flow carry-over where forward/backward flow is inconsistent (farneback/dis only)")
+@click.option('--motion-temporal-window', type=int, default=1, help="causal spatiotemporal smoothing: average the flow over the last N frames (1 = off)")
 # debugging/progress options
 @click.option('--show-detector/--no-show-detector', is_flag=True, default=False, help="show the controlnet detector output")
 @click.option('--show-input/--no-show-input', is_flag=True, default=False, help="show the input frame")
@@ -733,24 +495,36 @@ def find_unused_filename(basename, fmt="-{:d}"):
 @click.option('--color-amount', type=float, default=0.0, help="blend between the original color and the color matched version, 0.0-1.0")
 @click.option('--color-info', is_flag=True, default=False, help="print extra stats about the color content of the output to help debug color drift issues")
 # Detector-specific options
-@click.option('--canny-low-thr', type=float, default=100, help="canny edge detector lower threshold")
-@click.option('--canny-high-thr', type=float, default=200, help="canny edge detector higher threshold")
-@click.option('--mlsd-score-thr', type=float, default=0.1, help="mlsd line detector v threshold")
-@click.option('--mlsd-dist-thr', type=float, default=0.1, help="mlsd line detector d threshold")
+@click.option('--canny-low-thr', type=float, default=100, help="canny edge detector lower threshold (fluxcanny, unionxl --control-type canny)")
+@click.option('--canny-high-thr', type=float, default=200, help="canny edge detector higher threshold (fluxcanny, unionxl --control-type canny)")
 # reference only (--controlnet refxl)
 @click.option('--swap-images', is_flag=True, default=False, help="Switch the init and reference images when using reference-only controlnet")
+# video-filter chains (see videofilters.py --list-filters); each is an animatable filter-chain
+# spec applied at one point in the frame loop. spec values may be animation curves evaluated on
+# the same x as --audio-animate. e.g. --input-filter 'bilateral d=7; saturation amount=1.2'
+@click.option('--input-filter', type=str, default=None, help="filter chain applied to each raw input frame (affects everything downstream)")
+@click.option('--feedforward-filter', type=str, default=None, help="filter chain applied to the input's feedforward contribution to the next init image")
+@click.option('--motion-filter', type=str, default=None, help="filter chain applied to the frames fed into the motion estimator")
+@click.option('--control-filter', type=str, default=None, help="filter chain applied to the control/conditioning image")
+@click.option('--feedback-filter', type=str, default=None, help="filter chain applied to the motion-warped previous output before it is fed back")
+@click.option('--output-filter', type=str, default=None, help="filter chain applied to the final output frame")
 def main(input_video, output_video, overwrite, start_time, end_time,
 		duration, output_bitrate, output_codec,
 		max_dimension, min_dimension, round_dims_to,
 		no_audio, audio_from, audio_offset, audio_animate, prompt, negative_prompt,
 		prompt_strength, num_inference_steps, controlnet,
 		controlnet_strength, fix_orientation, init_image_strength,
-		feedthrough_strength, motion_alpha, motion_sigma,
+		feedthrough_strength, motion_estimator, motion_alpha, motion_sigma,
+		motion_spatial_filter, motion_occlusion, motion_temporal_window,
 		show_detector, show_input, show_output, show_motion,
 		dump_frames, skip_dumped_frames, dump_video,
 		color_fix, color_amount, color_info, canny_low_thr=None,
-		canny_high_thr=None, mlsd_score_thr=None, mlsd_dist_thr=None,
-		swap_images = False
+		canny_high_thr=None,
+		swap_images = False,
+		input_filter=None, feedforward_filter=None, motion_filter=None,
+		control_filter=None, feedback_filter=None, output_filter=None,
+		control_type='depth', union_model='brad-twinkl/controlnet-union-sdxl-1.0-promax',
+		ip_adapter=False, ip_adapter_scale=0.6, ip_adapter_source='feedback'
 		):
 
 	# substitute {} placeholders in output_video with input_video basename
@@ -769,7 +543,7 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 			raise ArgumentError(f"Must specify both input and output video filenames as positional arguments")
 
 	# split audio animation argument into a dict to pass into the processing function below
-	animatable_params = ["denoise", "feedthrough", "control", "guidance"]
+	animatable_params = ["denoise", "feedthrough", "control", "guidance", "ipadapter"]
 	if audio_animate != None:
 		audio_params = {}
 		for audio_anim_stmt in audio_animate.split(";"):
@@ -790,30 +564,78 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 	else:
 		audio_params = None
 
+	# parse the video-filter chains once, before the slow models load, so a bad spec fails fast.
+	# each is a videofilters.FilterChain applied at one point in the frame loop, or None if unset.
+	def build_filter_chain(spec, label):
+		if not spec:
+			return None
+		try:
+			chain = videofilters.parse_video_filter_spec(spec)
+			print(f"Parsed --{label}-filter: {len(chain.steps)} filter(s), requires_depth={chain.requires_depth}")
+			return chain
+		except Exception as e:
+			raise ArgumentError(f"Invalid --{label}-filter chain spec: {e}")
+
+	input_chain = build_filter_chain(input_filter, "input")
+	feedforward_chain = build_filter_chain(feedforward_filter, "feedforward")
+	motion_chain = build_filter_chain(motion_filter, "motion")
+	control_chain = build_filter_chain(control_filter, "control")
+	feedback_chain = build_filter_chain(feedback_filter, "feedback")
+	output_chain = build_filter_chain(output_filter, "output")
+
 	# run controlnet pipeline on video
 
-	# choose controlnet model and detector based on the --controlnet option
-	# this also affects the default scheduler and the stable diffusion model version required, in the case of aesthetic controlnet
-	scheduler = 'unipc'
-	sdmodel = 'runwayml/stable-diffusion-v1-5'
+	# choose the controlnet model and detector based on the --controlnet option
 	use_sdxl = False
 	use_flux = False
 	use_sdxl_reference = False
+	use_union = False
+	union_control_mode = None
 
 	print("Loading controlnet model:", controlnet)
 
-	if controlnet == 'refxl':
+	if controlnet == 'unionxl':
+		import torch  # local, because other branches in main do `import torch` (making it function-local)
+		# SDXL ControlNet-Union: one controlnet, the --control-type picks the detector + mode.
+		# union control mode indices (xinsir ControlNetPlus): 0=openpose 1=depth 2=softedge 3=canny 4=normal 5=segment
+		union_modes = {'openpose': 0, 'depth': 1, 'softedge': 2, 'canny': 3, 'normal': 4}
+		union_control_mode = union_modes[control_type]
+		if control_type == 'depth':
+			detector_kwargs = dict()
+			detector_model = DPTDepthDetectorWrapper()
+		elif control_type == 'canny':
+			detector_kwargs = dict({
+				"low_threshold": canny_low_thr if canny_low_thr != None else 50,
+				"high_threshold": canny_high_thr if canny_high_thr != None else 200,
+			})
+			detector_model = CannyDetector()
+		elif control_type == 'openpose':
+			from controlnet_aux import OpenposeDetector
+			detector_kwargs = dict()
+			detector_model = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+		elif control_type == 'softedge':
+			from controlnet_aux import HEDdetector
+			detector_kwargs = dict()
+			detector_model = HEDdetector.from_pretrained("lllyasviel/ControlNet")
+		elif control_type == 'normal':
+			from controlnet_aux import NormalBaeDetector
+			detector_kwargs = dict()
+			detector_model = NormalBaeDetector.from_pretrained("lllyasviel/Annotators")
+		else:
+			raise NotImplementedError(f"--control-type {control_type} not supported for unionxl")
+		print(f"Loading SDXL ControlNet-Union model {union_model} (control-type={control_type}, mode={union_control_mode})...")
+		controlnet_model = ControlNetUnionModel.from_pretrained(union_model, torch_dtype=torch.float16)
+		use_union = True
+	elif controlnet == 'refxl':
 		detector_kwargs = dict()
 		detector_model = None #DPTDepthDetectorWrapper()
 		controlnet_model = None #detector_model.load_controlnet()
-		sdmodel = None
 		use_sdxl = False
 		use_sdxl_reference = True
 	elif controlnet == 'depthxl':
 		detector_kwargs = dict()
 		detector_model = DPTDepthDetectorWrapper()
 		controlnet_model = detector_model.load_controlnet()
-		sdmodel = None
 		use_sdxl = True
 	elif controlnet == 'fluxcanny':
 		from diffusers import FluxControlNetModel
@@ -825,81 +647,17 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 		detector_model = CannyDetector()
 		controlnet_model = FluxControlNetModel.from_pretrained("InstantX/FLUX.1-dev-Controlnet-Canny-alpha", torch_dtype=torch.bfloat16)
 		use_flux = True
-	elif controlnet == 'canny':
-		detector_kwargs = dict({
-			"low_threshold": canny_low_thr if canny_low_thr != None else 50,
-			"high_threshold": canny_high_thr if canny_high_thr != None else 200
-		})
-		detector_model = CannyDetector()
-		controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-canny", torch_dtype=torch.float16)
-	elif controlnet == 'canny21':
-		detector_kwargs = dict({
-			"low_threshold": canny_low_thr if canny_low_thr != None else 50,
-			"high_threshold": canny_high_thr if canny_high_thr != None else 200
-		})
-		detector_model = CannyDetector()
-		controlnet_model = ControlNetModel.from_pretrained("thibaud/controlnet-sd21-canny-diffusers", torch_dtype=torch.float16)
-		sdmodel = 'stabilityai/stable-diffusion-2-1'
-	elif controlnet == 'openpose':
-		detector_kwargs = dict()
-		detector_model = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
-		controlnet_model = ControlNetModel.from_pretrained("fusing/stable-diffusion-v1-5-controlnet-openpose", torch_dtype=torch.float16)
-	elif controlnet == 'openpose21':
-		detector_kwargs = dict()
-		detector_model = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
-		controlnet_model = ControlNetModel.from_pretrained("thibaud/controlnet-sd21-openpose-diffusers", torch_dtype=torch.float16)
-		sdmodel = 'stabilityai/stable-diffusion-2-1'
-	elif controlnet == 'depth':
-		detector_kwargs = dict()
-		detector_model = MidasDetectorWrapper()
-		controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-depth", torch_dtype=torch.float16)
-	elif controlnet == 'depth21':
-		detector_kwargs = dict()
-		detector_model = MidasDetectorWrapper()
-		controlnet_model = ControlNetModel.from_pretrained("thibaud/controlnet-sd21-depth-diffusers", torch_dtype=torch.float16)
-		sdmodel = 'stabilityai/stable-diffusion-2-1'
-	elif controlnet == 'mlsd':
-		detector_kwargs = dict({
-			'thr_v': 0.1 if mlsd_score_thr==None else mlsd_score_thr,
-			'thr_d': 0.1 if mlsd_dist_thr==None else mlsd_dist_thr
-		})
-		detector_model = MLSDdetector.from_pretrained("lllyasviel/ControlNet")
-		controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-mlsd", torch_dtype=torch.float16)
-	elif controlnet == 'lineart21':
-		detector_kwargs = dict({
-			'thr_v': 0.1 if mlsd_score_thr==None else mlsd_score_thr,
-			'thr_d': 0.1 if mlsd_dist_thr==None else mlsd_dist_thr
-		})
-		detector_model = MLSDdetector.from_pretrained("lllyasviel/ControlNet")
-		controlnet_model = ControlNetModel.from_pretrained("thibaud/controlnet-sd21-lineart-diffusers", torch_dtype=torch.float16)
-		sdmodel = 'stabilityai/stable-diffusion-2-1'
-	elif controlnet == 'hed':
-		detector_kwargs = dict()
-		detector_model = HEDdetector.from_pretrained("lllyasviel/ControlNet")
-		controlnet_model = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed", torch_dtype=torch.float16)
-	elif controlnet == 'hed21':
-		detector_kwargs = dict()
-		detector_model = HEDdetector.from_pretrained("lllyasviel/ControlNet")
-		controlnet_model = ControlNetModel.from_pretrained("thibaud/controlnet-sd21-hed-diffusers", torch_dtype=torch.float16)
-		sdmodel = 'stabilityai/stable-diffusion-2-1'
-	elif controlnet == 'normal':
-		detector_kwargs = dict()
-		detector_model = MidasDetectorWrapper(1)
-		controlnet_model = ControlNetModel.from_pretrained("fusing/stable-diffusion-v1-5-controlnet-normal", torch_dtype=torch.float16)
-	elif controlnet == 'aesthetic':
-		detector_kwargs = dict({
-			"low_threshold": canny_low_thr if canny_low_thr != None else 50,
-			"high_threshold": canny_high_thr if canny_high_thr != None else 200
-		})
-		detector_model = CannyDetector()
-		controlnet_model = None
-		sdmodel = "krea/aesthetic-controlnet"
 	else:
 		raise NotImplementedError("controlnet type not implemented")
 
-	# intantiate the motion estimation model
-	print("Loading RAFT optical flow model...")
-	motion = RAFTMotionEstimator()
+	# intantiate the motion estimation model (pluggable: raft / raft_small / farneback / dis)
+	print(f"Loading motion estimator: {motion_estimator}...")
+	motion = motionestimators.create_estimator(
+		motion_estimator,
+		spatial_filter=motion_spatial_filter,
+		occlusion=motion_occlusion,
+		temporal_window=motion_temporal_window,
+	)
 
 	# instantiate the diffusion pipeline
 	if use_flux == True:
@@ -951,6 +709,24 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 		text_encoder.to("cpu")
 		flush()
 		print(f"Prompt encoding time: {time.time() - start}")
+	elif use_union == True:
+		print("Loading SDXL VAE...")
+		import torch
+		vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
+		print("Loading SDXL ControlNet-Union diffusion pipeline...")
+		pipe = StableDiffusionXLControlNetUnionImg2ImgPipeline.from_pretrained(
+				"stabilityai/stable-diffusion-xl-base-1.0",
+				controlnet=controlnet_model,
+				vae=vae,
+				variant="fp16",
+				use_safetensors=True,
+				torch_dtype=torch.float16,
+		)
+		if ip_adapter:
+			print(f"Loading IP-Adapter (sdxl) for feedback, scale={ip_adapter_scale}...")
+			pipe.load_ip_adapter("h94/IP-Adapter", subfolder="sdxl_models", weight_name="ip-adapter_sdxl.bin")
+			pipe.set_ip_adapter_scale(ip_adapter_scale)
+		pipe.enable_model_cpu_offload()
 	elif use_sdxl == True:
 		print("Loading SDXL VAE...")
 		import torch
@@ -964,6 +740,10 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 				use_safetensors=True,
 				torch_dtype=torch.float16,
 		)
+		if ip_adapter:
+			print(f"Loading IP-Adapter (sdxl) for feedback, scale={ip_adapter_scale}...")
+			pipe.load_ip_adapter("h94/IP-Adapter", subfolder="sdxl_models", weight_name="ip-adapter_sdxl.bin")
+			pipe.set_ip_adapter_scale(ip_adapter_scale)
 		pipe.enable_model_cpu_offload()
 	elif use_sdxl_reference == True:
 		import torch
@@ -979,23 +759,6 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 				torch_dtype=torch.float16,
 		)
 		pipe.enable_model_cpu_offload()
-	else:
-		print(f"Loading SD-2.1 model {sdmodel}...")
-		# legacy sd2.1 model with controlnet
-		if controlnet_model != None:
-			pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(sdmodel, controlnet=controlnet_model, torch_dtype=torch.float16)
-		else:
-			pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(sdmodel, torch_dtype=torch.float16)
-
-		# set the scheduler... this is a bit hacky but it works
-		if scheduler == 'unipcm':
-			pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-		elif scheduler == 'eulera':
-			pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
-
-		pipe.enable_xformers_memory_efficient_attention()
-		pipe.enable_model_cpu_offload()
-		pipe.run_safety_checker = lambda image, text_embeds, text_embeds_negative: (image, False)
 
 	# ----------------------------------------------------------------------------------------------
 	# okay, now we have our pipeline and auxiliary models set up, let's process the video
@@ -1007,19 +770,27 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 
 	first_output_frame = None
 	prev_input_frame = None
+	prev_motion_frame = None
 	prev_output_frame = None
 	prev_input_gray = None
 	prev_predicted_output_frame = None
 	flow = None
 
-	def frame_filter(framenum, input_frame, **params):
+	def frame_filter(framenum, input_frame, _anim_x=0.0, _anim_fps=None, **params):
 		# state kept between frames
 		nonlocal prev_input_frame
+		nonlocal prev_motion_frame
 		nonlocal prev_input_gray
 		nonlocal prev_output_frame
 		nonlocal prev_predicted_output_frame
 		nonlocal first_output_frame
 		nonlocal flow
+
+		# helper to run one of the video-filter chains at the current animation position
+		def apply_chain(chain, image):
+			if chain is None or image is None:
+				return image
+			return chain(image, x=_anim_x, n=framenum, fps=_anim_fps)
 
 		#print(f"Processing frame {framenum} {input_frame.width}x{input_frame.height} shape={np.asarray(input_frame).shape}...")
 		print()
@@ -1034,6 +805,8 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 		width = input_frame.width
 		height = input_frame.height
 		input_image = input_frame.copy()
+		# INPUT filter point: applied to the raw input frame, affects everything downstream
+		input_image = apply_chain(input_chain, input_image)
 		input_frame = np.asarray(input_image)
 
 		# Converts each frame to grayscale as required by optical flow
@@ -1056,11 +829,17 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 		else:
 			dump_frames_filename = None
 
+		# MOTION filter point: the (possibly separately filtered) frames fed to the estimator.
+		# kept in its own prev_motion_frame stream so both frames compared are filtered alike.
+		motion_input = apply_chain(motion_chain, input_image.copy()) if motion_chain is not None else input_image
+
 		# if we have a previous frame, transfer motion from the input to the output and blend with the noise
-		if prev_input_frame != None and not skipped:
+		if prev_motion_frame is not None and not skipped:
 			#flow, smoothed_flow = estimate_motion_raft(prev_input_frame, input_frame, flow, motion_smoothing)
-			flow = motion.estimate_motion(prev_input_frame, input_image, flow, motion_alpha, motion_sigma)
+			flow = motion.estimate_motion(prev_motion_frame, motion_input, flow, motion_alpha, motion_sigma)
 			predicted_output_frame = motion.transfer_motion(flow, prev_output_frame)
+			# FEEDBACK filter point: the motion-warped previous output, before it is fed back
+			predicted_output_frame = apply_chain(feedback_chain, predicted_output_frame)
 		else:
 			predicted_output_frame = None
 
@@ -1070,6 +849,8 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 			else:
 				control_image = input_image.copy()
 			control_image = control_image.resize((input_image.width, input_image.height))
+			# CONTROL filter point: applied to the control/conditioning image fed to the pipeline
+			control_image = apply_chain(control_chain, control_image)
 			ci = np.asarray(control_image)
 			#print(f"ci.shape={ci.shape} ci.min={ci.min()} ci.max={ci.max()} ci.mean={ci.mean()} ci.std={ci.std()}")
 
@@ -1082,13 +863,31 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 			controlnet_strength = params["control"]
 		if "guidance" in params.keys():
 			prompt_strength = params["guidance"]
+		if ip_adapter and "ipadapter" in params.keys():
+			# IP-Adapter strength is animatable; apply the per-frame scale to the loaded adapter
+			pipe.set_ip_adapter_scale(params["ipadapter"])
 
-		if predicted_output_frame == None:
+		# IP-Adapter feedback reference: the image used as the image-prompt for this frame.
+		# 'feedback' = motion-warped previous output (falls back to the input on the first frame).
+		if ip_adapter:
+			if ip_adapter_source == 'input':
+				ip_ref = input_image
+			elif ip_adapter_source == 'output':
+				ip_ref = prev_output_frame if prev_output_frame is not None else input_image
+			else:  # 'feedback'
+				ip_ref = predicted_output_frame if predicted_output_frame is not None else input_image
+		else:
+			ip_ref = None
+
+		# FEEDFORWARD filter point: the input's contribution to the next init image
+		feedforward_image = apply_chain(feedforward_chain, input_image.copy()) if feedforward_chain is not None else input_image
+
+		if predicted_output_frame is None:
 			strength = feedthrough_strength * init_image_strength
-			init_image = input_image.copy()
+			init_image = feedforward_image.copy()
 		else:
 			strength = init_image_strength
-			init_image = PIL.Image.blend(input_image, predicted_output_frame, 1.0 - feedthrough_strength)
+			init_image = PIL.Image.blend(feedforward_image, predicted_output_frame, 1.0 - feedthrough_strength)
 
 		if output_frame == None:
 			ii = np.asarray(init_image)
@@ -1107,8 +906,26 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 							num_inference_steps=num_inference_steps,
 							guidance_scale=(prompt_strength/7.0)*3.5,
 					).images[0]
+			elif use_union == True:
+					union_kwargs = dict(
+						prompt=prompt,
+						guidance_scale=prompt_strength,
+						negative_prompt=negative_prompt,
+						num_inference_steps=num_inference_steps,
+						generator=generator,
+						image=init_image,
+						strength=1.0 - strength,
+						control_image=[control_image],
+						control_mode=[union_control_mode],
+						controlnet_conditioning_scale=controlnet_strength,
+						width=width,
+						height=height,
+					)
+					if ip_adapter:
+						union_kwargs["ip_adapter_image"] = ip_ref
+					output_frame = pipe(**union_kwargs).images[0]
 			elif use_sdxl == True:
-					output_frame = pipe(
+					sdxl_kwargs = dict(
 						prompt=prompt,
 						guidance_scale=prompt_strength,
 						negative_prompt=negative_prompt,
@@ -1116,9 +933,12 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 						generator=generator,
 						control_image=control_image,
 						controlnet_conditioning_scale=controlnet_strength,
-						image = init_image,
-						strength = 1.0 - strength,
-					).images[0]
+						image=init_image,
+						strength=1.0 - strength,
+					)
+					if ip_adapter:
+						sdxl_kwargs["ip_adapter_image"] = ip_ref
+					output_frame = pipe(**sdxl_kwargs).images[0]
 			elif use_sdxl_reference == True:
 					output_frame = pipe(
 						prompt=prompt,
@@ -1129,19 +949,6 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 						ref_image = control_image if swap_images else init_image,
 						#controlnet_conditioning_scale=controlnet_strength,
 						image = init_image if swap_images else control_image,
-						strength = 1.0 - strength,
-					).images[0]
-			else:
-					# run the pipeline
-					output_frame = pipe(
-						prompt=prompt,
-						guidance_scale=prompt_strength,
-						negative_prompt=negative_prompt,
-						num_inference_steps=num_inference_steps,
-						generator=generator,
-						controlnet_conditioning_image=[control_image],
-						controlnet_conditioning_scale=controlnet_strength,
-						image = init_image,
 						strength = 1.0 - strength,
 					).images[0]
 
@@ -1157,6 +964,11 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 						np.asarray(output_frame)*(1.0-color_amount) +
 						maintain_colors(np.asarray(first_output_frame), np.asarray(output_frame), color_fix)*color_amount
 					).astype(np.uint8))
+
+		# OUTPUT filter point: applied to the final output frame (and so to what is fed back).
+		# skipped frames are read back already-filtered from a previous dump, so don't re-apply.
+		if not skipped:
+			output_frame = apply_chain(output_chain, output_frame)
 
 		if show_motion:
 			if not (flow is None):
@@ -1193,6 +1005,7 @@ def main(input_video, output_video, overwrite, start_time, end_time,
 
 		#output_frame.save("frame.png")
 		prev_input_frame = input_image.copy()
+		prev_motion_frame = motion_input.copy()
 		prev_input_gray = input_gray
 		prev_output_frame = output_frame.copy()
 		prev_predicted_output_frame = predicted_output_frame

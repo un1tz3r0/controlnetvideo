@@ -15,3 +15,13 @@ logs/*
 logs
 shared/*
 shared
+
+# scratch / output artifacts
+*TEMP_MPY_*
+progress.png
+progress*.png
+.progress*.png
+out*.mp4
+outw*.mp4
+outwb*.mp4
+*.jsonl

@@ -27,15 +27,17 @@ by Victor Condino <un1tz3r0@gmail.com>, Oct 17 2024
 
 #### New! Features
 
-- Supports **SDXL Reference Only (ADAIN)** (*best results*) and **ControlNet** (*experimental*)
-- Supports **SDXL ControlNets**
-- Music video *beat-synced animation*
-- Animation with *arbitrary piecewise cubic spline curves*
-- **Flux.1** (initial support, works, only canny controlnet supported)
+- **SDXL ControlNet-Union** (`--controlnet unionxl`) — one model, `--control-type depth|canny|openpose|softedge|normal`
+- **IP-Adapter feedback** (`--ip-adapter`) — inject the motion-warped previous frame as an image prompt (modern replacement for reference-only)
+- **SDXL Reference-Only (ADAIN)** (`--controlnet refxl`) and **depth ControlNet** (`--controlnet depthxl`)
+- **Flux.1** with canny controlnet (`--controlnet fluxcanny`)
+- **Animatable video-filter chains** at six points in the pipeline (input / feedforward / motion / control / feedback / output) — see [Video filters](#video-filters)
+- **Pluggable motion estimation** (`--motion-estimator raft|raft_small|farneback|dis`) with edge-preserving + occlusion-aware flow smoothing
+- Music-video *beat-synced animation* with *piecewise cubic spline curves*, and a **cached** beat analysis (`<audio>.jsonl`, with per-beat/per-bar RMS intensity)
 
-I've added some support for **Flux.1**, and extensive **SDXL** support; both **controlnet** and **reference-only** control schemes.
+The animation system can sync parameter modulations to the beat of an audio file. It uses [madmom](https://github.com/CPJKU/madmom) to analyze the audio (results are cached next to the file as `.jsonl` so re-runs skip the slow analysis), and lets you specify piecewise cubic bezier curves to modulate parameters in time with the detected downbeats.
 
-Also new is an animation system that can sync parameter modulations to the beat of an audio file. This uses the [madmom](https://github.com/CPJKU/madmom) to analyze the audio, and allows specifying piecewise cubic bezier curves to modulate various parameters of the video processing in time with the downbeats detected in the audio track. (Examples coming soon.)
+> **Legacy note (v0.3.x):** the old per-type SD1.5/SD2.1 controlnet options (`canny`, `depth21`, `openpose`, `hed`, `mlsd`, `normal`, `aesthetic`, …) were removed — they are superseded by `unionxl`, which provides depth/canny/openpose/softedge/normal on SDXL from a single model.
 
 #### Examples of `--animation-params ...` and `--audio-from ...`
 
@@ -106,12 +108,12 @@ You should now be ready to run the script and process video files. If you are ha
 
 ## Example 1
 
-To process a video using _Stable Diffusion 2.1_ and a _ControlNet_ trained for __depth-to-image__ generation:
+To process a video using _SDXL_ and a _ControlNet_ for __depth-to-image__ generation:
 
 ```
 python3 controlnetvideo.py \
 	PXL_20230422_013745844.TS.mp4 \
-	--controlnet depth21 \
+	--controlnet depthxl \
 	--prompt 'graffuturism colorful intricate heavy detailed outlines' \
 	--prompt-strength 9 \
 	--show-input \
@@ -129,7 +131,7 @@ python3 controlnetvideo.py \
 	'{instem}_out.mp4'
 ```
 
-This will process the file `PXL_20230422_013745844.TS.mp4`, starting at `10 seconds` for a duration of `60 seconds`. It will process each input frame with some preprocessing (motion transfer/compensation of the output feedback), followed by a detector and diffusion models in a pipeline configured by the `--controlnet` option. Here, we are using `depth21`, which selects __Midas__ depth estimator for the detector and the __Stable Diffusion 2.1__ model and the matching pretrained __ControlNet__ model, in this case courtesy of [thibaud](https://huggingface.co/thibaud/), for `15` steps the first frame and `(1.0-0.4)*15 => 9` steps (this is because img2img skips initial denoising steps according to the init-image strength) for the remaining frames. The diffusion pipeline will be run with the prompt `'graffuturism colorful intricate heavy detailed outlines'` with a guidance strength of `9`, and full controlnet influence.
+This will process the file `PXL_20230422_013745844.TS.mp4`, starting at `10 seconds` for a duration of `60 seconds`. It will process each input frame with some preprocessing (motion transfer/compensation of the output feedback), followed by a detector and diffusion models in a pipeline configured by the `--controlnet` option. Here, we are using `depthxl`, which selects the __DPT__ depth estimator for the detector and the __SDXL__ base model with a matching pretrained depth __ControlNet__, for `15` steps on the first frame and `(1.0-0.4)*15 => 9` steps (img2img skips initial denoising steps according to the init-image strength) for the remaining frames. The diffusion pipeline will be run with the prompt `'graffuturism colorful intricate heavy detailed outlines'` with a guidance strength of `9`, and full controlnet influence. (For multiple conditioning types from a single model, use `--controlnet unionxl --control-type depth|canny|openpose|softedge|normal`.)
 
 During processing, it will show the input, the detector output, the motion estimate, and the output of each frame, by writing them to numbered `.png` image files in a directory `PXL_20230422_013745844.TS_frames/` which will be created if it does not exist. If you just want a single image file you can watch with a viewer which auto-refreshes upon the file changing on disk, then you can specify the filename to `--dump-frames` without a `{n}` substitution, causing it to continually overwrite the same file. This is useful for watching the progress of the video processing in real time.
 
@@ -146,7 +148,7 @@ Here's another example of the same video, but with a different prompt and differ
 ```
 python3 controlnetvideo.py \
         PXL_20230419_205030311.TS.mp4 \
-        --controlnet depth21 \
+        --controlnet depthxl \
         --prompt 'mirrorverse colorful intricate heavy detailed outlines' \
         --prompt-strength 10 \
         --show-input \
@@ -186,11 +188,69 @@ https://github.com/un1tz3r0/controlnetvideo/assets/851283/550ff6c7-5be3-4cf0-a25
   - more things I forgot to mention
 
 If there is interest, I will write up a more detailed guide to the options and how to use them.
-Usage: controlnetvideo.py [OPTIONS] INPUT_VIDEO OUTPUT_VIDEO
+
+-----
+
+# Video filters
+
+`controlnetvideo.py` can apply chains of animatable image filters at six points in the
+per-frame pipeline. Filters live in `videofilters.py`, which is also a standalone CLI:
+
+```sh
+# apply a filter chain directly to a video (no diffusion), and list all filters:
+python videofilters.py in.mp4 out.mp4 -f 'hueshift deg=L 0 0 1 180; pattern type=stripes, speed=2, blend=screen, amount=0.3'
+python videofilters.py --list-filters
+```
+
+### Filter-chain spec language
+
+```
+<filter> <key>=<value>, <key>=<value>; <filter> ...; ...
+```
+
+- filters in a chain are separated by `;`
+- params within a filter are separated by `,`
+- a value is either a constant (number, `#hexcolor`, name) **or** an animation curve using the
+  same `L x y` / `C x y a b c d` grammar as `--audio-animate` (evaluated per-frame at the same
+  position `x`: fractional bar with `--audio-from`, else fraction of the clip)
+
+Filter families (run `--list-filters` for the full set + params):
+
+- **blur/denoise/sharpen:** `blur`, `boxblur`, `bilateral`, `edgepreserve`, `nlmeans`, `tdenoise`, `sharpen`
+- **color:** `hsl`, `hueshift`, `saturation`, `brightness`, `contrast`, `gamma`
+- **distortions** (origin + velocity, time-accumulated): `pan`, `zoom`, `spin`
+- **depth/detector:** `lineart`, `depthfx` (brighten/darken/blur/outline/inner+outer shadow/blur, fg/bg regions)
+- **pattern overlays:** `pattern type=stripes|dashed|zigzag|chevron|checker|grid|polkadot|honeycomb` with 10 blend modes
+
+### Filter-chain insertion points
+
+| Option | Where it applies |
+|---|---|
+| `--input-filter` | each raw input frame (affects everything downstream) |
+| `--feedforward-filter` | the input's contribution to the next init image |
+| `--motion-filter` | the frames fed to the motion estimator |
+| `--control-filter` | the control/conditioning image |
+| `--feedback-filter` | the motion-warped previous output, before feedback |
+| `--output-filter` | the final output frame (also what is fed back) |
+
+Example — denoise the input, tint the output over time, and stabilize feedback temporally:
+
+```sh
+python3 controlnetvideo.py in.mp4 out.mp4 \
+    --controlnet unionxl --control-type depth --ip-adapter --ip-adapter-scale 0.5 \
+    --prompt 'studio ghibli city' \
+    --input-filter 'bilateral d=7' \
+    --feedback-filter 'tdenoise alpha=0.6' \
+    --output-filter 'saturation amount=1.1; hueshift deg=L 0 0 1 30'
+```
+
+-----
 
 # Usage
 
 ```
+Usage: controlnetvideo.py [OPTIONS] INPUT_VIDEO OUTPUT_VIDEO
+
 Options:
   --overwrite / --no-overwrite    don't overwrite existing output file -- add
                                   a numeric suffix to get a unique filename.
@@ -236,11 +296,31 @@ Options:
                                   number of inference steps, depends on the
                                   scheduler, trades off speed for quality.
                                   20-50 is a good range from fastest to best.
-  --controlnet [refxl|fluxcanny|depthxl|aesthetic|lineart21|hed|hed21|canny|canny21|openpose|openpose21|depth|depth21|normal|mlsd]
-                                  which pretrained model and controlnet type
-                                  to use. the default, depthxl, uses the dpt
-                                  depth estimator and controlnet with the sdxl
-                                  base model
+  --controlnet [unionxl|refxl|fluxcanny|depthxl]
+                                  which pretrained model and conditioning to
+                                  use. 'unionxl' = SDXL ControlNet-Union (one
+                                  model, --control-type selects the
+                                  conditioning); 'depthxl' = DPT depth + depth
+                                  controlnet on SDXL; 'refxl' = SDXL
+                                  reference-only; 'fluxcanny' = FLUX.1 with
+                                  canny controlnet
+  --control-type [depth|canny|openpose|softedge|normal]
+                                  for --controlnet unionxl: which conditioning
+                                  the ControlNet-Union model is fed (selects
+                                  the detector and the union control mode)
+  --union-model TEXT              huggingface repo for the SDXL ControlNet-
+                                  Union model used by --controlnet unionxl
+  --ip-adapter / --no-ip-adapter  enable IP-Adapter image-prompt feedback
+                                  (SDXL): the warped previous output frame
+                                  conditions the next frame
+  --ip-adapter-scale FLOAT        IP-Adapter image-prompt strength (0..1+);
+                                  animatable via --audio-animate key
+                                  'ipadapter'
+  --ip-adapter-source [feedback|input|output]
+                                  which image to use as the IP-Adapter prompt:
+                                  'feedback'=motion-warped prev output,
+                                  'input'=current input frame, 'output'=prev
+                                  output (un-warped)
   --controlnet-strength FLOAT     how much influence the controlnet
                                   annotator's output is used to guide the
                                   denoising process
@@ -250,11 +330,28 @@ Options:
   --feedthrough-strength FLOAT    the ratio of input to motion compensated
                                   prior output to feed through to the next
                                   frame
+  --motion-estimator [raft|raft_small|farneback|dis]
+                                  dense optical flow method. 'raft' (default,
+                                  GPU) is the original; 'raft_small' is
+                                  lighter; 'farneback' and 'dis' are CPU (no
+                                  GPU needed)
   --motion-alpha FLOAT            smooth the motion vectors over time, 0.0 is
                                   no smoothing, 1.0 is maximum smoothing
   --motion-sigma FLOAT            smooth the motion estimate spatially, 0.0 is
-                                  no smoothing, used as sigma for gaussian
-                                  blur
+                                  no smoothing, used as sigma for the spatial
+                                  filter
+  --motion-spatial-filter [gaussian|bilateral]
+                                  spatial flow smoothing kernel used with
+                                  --motion-sigma: 'gaussian' (legacy) or
+                                  'bilateral' (edge-preserving, keeps motion
+                                  boundaries)
+  --motion-occlusion / --no-motion-occlusion
+                                  occlusion-aware temporal smoothing: suppress
+                                  flow carry-over where forward/backward flow
+                                  is inconsistent (farneback/dis only)
+  --motion-temporal-window INTEGER
+                                  causal spatiotemporal smoothing: average the
+                                  flow over the last N frames (1 = off)
   --show-detector / --no-show-detector
                                   show the controlnet detector output
   --show-input / --no-show-input  show the input frame
@@ -281,11 +378,23 @@ Options:
   --color-info                    print extra stats about the color content of
                                   the output to help debug color drift issues
   --canny-low-thr FLOAT           canny edge detector lower threshold
+                                  (fluxcanny, unionxl --control-type canny)
   --canny-high-thr FLOAT          canny edge detector higher threshold
-  --mlsd-score-thr FLOAT          mlsd line detector v threshold
-  --mlsd-dist-thr FLOAT           mlsd line detector d threshold
+                                  (fluxcanny, unionxl --control-type canny)
   --swap-images                   Switch the init and reference images when
                                   using reference-only controlnet
+  --input-filter TEXT             filter chain applied to each raw input frame
+                                  (affects everything downstream)
+  --feedforward-filter TEXT       filter chain applied to the input's
+                                  feedforward contribution to the next init
+                                  image
+  --motion-filter TEXT            filter chain applied to the frames fed into
+                                  the motion estimator
+  --control-filter TEXT           filter chain applied to the
+                                  control/conditioning image
+  --feedback-filter TEXT          filter chain applied to the motion-warped
+                                  previous output before it is fed back
+  --output-filter TEXT            filter chain applied to the final output
+                                  frame
   --help                          Show this message and exit.
 ```
-
